@@ -6,9 +6,10 @@ services:
     restart: unless-stopped
     init: false            # tini is already the entrypoint
     ports:
-      # FastPanel's Nginx on the same server proxies to 127.0.0.1:3080.
-      # (Use "3080:8080" instead if Nginx runs on another machine.)
-      - "127.0.0.1:3080:8080"
+      # Default: only reachable from this machine (FastPanel on the same server).
+      # If Nginx runs on another machine, put BIND_ADDR=0.0.0.0 in a .env file
+      # (the Proxmox installer does this for you).
+      - "${BIND_ADDR:-127.0.0.1}:3080:8080"
     volumes:
       - ./data:/data       # browser profiles = everyone's logins; back this up
     shm_size: "1gb"

@@ -40,6 +40,23 @@ generates its own cookie-signing key in `./data/secret.key`.
 
 Check that it runs: `curl http://127.0.0.1:3080/healthz` → `{"ok":true,...}`
 
+## Proxmox: one command
+
+On the **Proxmox host** (as root), run:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HeyvaertSeppe/snaprevpro/claude/friendly-fermi-ri5uzx/proxmox/install-ct.sh)"
+```
+
+This creates a Debian 12 LXC container (10 cores, 20 GB RAM, 40 GB disk, Docker
+inside, starts on boot), installs and starts snaprevpro, and prints the
+address to use in FastPanel, e.g. `http://192.168.1.77:3080`. In the Nginx
+config below, use that address instead of `127.0.0.1:3080`.
+
+Options: `CTID=120 CORES=10 RAM_MB=20480 DISK_GB=40 BRIDGE=vmbr0 STORAGE=local-lvm
+IP=192.168.1.77/24 GW=192.168.1.1 bash install-ct.sh` (all optional; a fixed IP
+is recommended so the FastPanel address never changes).
+
 ## FastPanel setup (web.heyvaertseppe.be)
 
 The backend address is **`http://127.0.0.1:3080`**: the container is on the same
