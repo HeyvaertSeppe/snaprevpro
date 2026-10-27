@@ -71,6 +71,93 @@ function injected() {
   window.addEventListener('focusin', focusChanged, true);
   window.addEventListener('focusout', focusChanged, true);
 
+  // ---- caret position + text style, for the instant-typing preview on the
+  // visitor's device (typed letters are drawn there before the video shows them) ----
+  const MIRROR_PROPS = ['boxSizing', 'width', 'height', 'overflowX', 'overflowY', 'borderTopWidth', 'borderRightWidth',
+    'borderBottomWidth', 'borderLeftWidth', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'fontStyle',
+    'fontVariant', 'fontWeight', 'fontStretch', 'fontSize', 'lineHeight', 'fontFamily', 'textAlign', 'textTransform',
+    'textIndent', 'letterSpacing', 'wordSpacing', 'tabSize'];
+  const fieldCaret = (el) => {
+    // classic "mirror div" measurement for <input>/<textarea>
+    const cs = getComputedStyle(el);
+    const div = document.createElement('div');
+    const st = div.style;
+    st.position = 'absolute'; st.visibility = 'hidden'; st.top = '0'; st.left = '-9999px';
+    st.whiteSpace = el.tagName === 'INPUT' ? 'pre' : 'pre-wrap';
+    st.wordWrap = 'break-word';
+    for (const prop of MIRROR_PROPS) st[prop] = cs[prop];
+    const pos = el.selectionEnd == null ? el.value.length : el.selectionEnd;
+    div.textContent = el.value.substring(0, pos);
+    const span = document.createElement('span');
+    span.textContent = el.value.substring(pos) || '.';
+    div.appendChild(span);
+    (document.body || document.documentElement).appendChild(div);
+    const r = el.getBoundingClientRect();
+    const dr = div.getBoundingClientRect();
+    const sr = span.getClientRects()[0] || span.getBoundingClientRect();
+    const h = sr.height || parseFloat(cs.fontSize) * 1.2; // glyph box of this font
+    const x = r.left + (sr.left - dr.left) - el.scrollLeft;
+    // single-line inputs centre their text vertically
+    const y = el.tagName === 'INPUT' ? r.top + (r.height - h) / 2 : r.top + (sr.top - dr.top) - el.scrollTop;
+    div.remove();
+    return { x, y, h, style: cs, len: el.value.length };
+  };
+  const editableCaret = (el) => {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0).cloneRange();
+    range.collapse(false);
+    let rect = null;
+    const rects = range.getClientRects();
+    if (rects.length) rect = rects[rects.length - 1];
+    let node = range.endContainer;
+    if (node.nodeType !== 1) node = node.parentElement;
+    const cs = getComputedStyle(node || el);
+    if (!rect || (!rect.height && !rect.width && !rect.left)) {
+      // empty field / empty line: use the element's content box
+      const r = (node || el).getBoundingClientRect();
+      const ecs = getComputedStyle(node || el);
+      rect = { left: r.left + parseFloat(ecs.paddingLeft) + parseFloat(ecs.borderLeftWidth),
+        top: r.top + parseFloat(ecs.paddingTop) + parseFloat(ecs.borderTopWidth), height: 0 };
+    }
+    // the caret rect is the glyph box of the current font: use it as-is
+    const h = rect.height || parseFloat(cs.fontSize) * 1.15;
+    return { x: rect.left, y: rect.top, h, style: cs, len: (el.textContent || '').length };
+  };
+  const bgOf = (el) => {
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      const c = getComputedStyle(n).backgroundColor;
+      if (c && c !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(c)) return c;
+    }
+    return 'rgb(255, 255, 255)';
+  };
+  let lastCaret = '';
+  let caretTimer = null;
+  const reportCaret = () => {
+    caretTimer = null;
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    let info = null;
+    try {
+      if (isEditable(a)) {
+        const c = a.isContentEditable ? editableCaret(a) : fieldCaret(a);
+        if (c) {
+          const st = c.style;
+          info = {
+            x: Math.round(c.x * 10) / 10, y: Math.round(c.y * 10) / 10, h: Math.round(c.h * 10) / 10,
+            font: `${st.fontStyle} ${st.fontWeight} ${st.fontSize} ${st.fontFamily}`,
+            ls: st.letterSpacing, color: st.color, bg: bgOf(a), len: c.len,
+          };
+        }
+      }
+    } catch (e) { info = null; }
+    const key = JSON.stringify(info);
+    if (key !== lastCaret) { lastCaret = key; signal({ t: 'caret', c: info }); }
+  };
+  const caretSoon = () => { if (!caretTimer) caretTimer = setTimeout(reportCaret, 15); };
+  ['focusin', 'focusout', 'input', 'keyup', 'mouseup', 'scroll', 'resize'].forEach((ev) => window.addEventListener(ev, caretSoon, true));
+  document.addEventListener('selectionchange', caretSoon, true);
+
   // ---- context menu: a native menu would be invisible, so block it when the site didn't ----
   window.addEventListener('contextmenu', (e) => e.preventDefault());
 

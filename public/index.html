@@ -15,6 +15,8 @@
 <body>
   <canvas id="screen"></canvas>
   <button id="closepopup" hidden aria-label="Close window">✕</button>
+  <div id="predict" hidden></div>
+  <div id="stats" hidden></div>
 
   <div id="overlay"><div class="spinner"></div><p id="status-text">Connecting…</p></div>
   <div id="toast" role="status"></div>
@@ -23,6 +25,8 @@
     <button data-act="link">Use this session on another device…</button>
     <button data-act="restart">Restart my browser</button>
     <button data-act="sound">Sound: on</button>
+    <button data-act="predict">Instant typing preview: on</button>
+    <button data-act="stats">Connection info: off</button>
     <button data-act="close">Close menu</button>
   </div>
 

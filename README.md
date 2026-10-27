@@ -110,8 +110,8 @@ endless "Reconnecting…" with older versions of this app.
 In Cloudflare Zero Trust → *Networks → Tunnels → your tunnel → Public
 hostname*, add `web.heyvaertseppe.be` with **one** of these services:
 
-* **Recommended, directly to the container** (skips Nginx, fewest hops):
-  Type `HTTP`, URL `10.1.3.241:3080`.
+* **Recommended, directly to the container** (skips FastPanel/Nginx entirely,
+  nothing to configure there, fewest hops): Type `HTTP`, URL `10.1.3.241:3080`.
 * **Through FastPanel's Nginx**: type `HTTP`, URL `10.1.2.222:80`, and under
   *Additional application settings → HTTP Settings* set **HTTP Host Header**
   to `web.heyvaertseppe.be`. (With type `HTTPS` → `10.1.2.222:443`, also set
@@ -171,6 +171,9 @@ There's no visible UI. A hidden menu opens with **Ctrl+Alt+Shift+M**, a
   login to another device. Anyone with this link can use your account, so don't share it.
 * **Restart my browser**: use it if the page gets stuck. You stay logged in.
 * **Sound on/off**
+* **Instant typing preview on/off** (see *Speed* below)
+* **Connection info**: round-trip time, frames per second, decode time,
+  picture size and connection type, live in a corner of the screen
 
 ## Resources
 
@@ -199,6 +202,43 @@ scrolling or watching video (capped by `VIDEO_MAX_MBIT`).
 (capture, encode, decode). On the same Wi-Fi as the server that's near-instant.
 Over 4G it feels like a fast remote desktop. It can never be exactly as instant
 as running Snapchat on the device itself.
+
+## Speed: why typing can feel delayed, and what helps
+
+Every key press travels device → Cloudflare → your home → the browser in the
+container, and the updated picture travels back. What you feel is roughly:
+**network round trip + ~1–3 frames** (render, capture/encode, decode).
+FastPanel/Nginx adds well under 1 ms; the round trip is what counts.
+
+What the app does about it:
+
+* **Instant typing preview** (on by default): letters you type appear at
+  once at the text cursor, in the field's own font and colour, and are
+  replaced by the real text when the video catches up (the same trick Mosh
+  and cloud-gaming apps use). Measured: the preview appears within 0–3 ms of
+  the key press.
+* Video at up to 60 fps with a low-latency encoder. The frame rate is only
+  lowered when a device's decoder really can't keep up.
+* The page's position on the virtual screen is measured to the pixel, so
+  clicks and the typing preview land exactly where you expect.
+
+What you can do:
+
+* Open the hidden menu → **Connection info**. If *round trip* is high
+  (> 80 ms), the delay is the network/tunnel, not the server.
+* Point the Cloudflare tunnel **directly at the container** (above).
+* At home on the same network, open `http://10.1.3.241:3080` directly: the
+  round trip drops to a few ms. (Camera/mic need HTTPS, so use the normal
+  address for video calls.)
+* If *decode* is high on an old phone, set `FPS=30` in `docker-compose.yml`.
+
+Why not just proxy the real Snapchat site into your own browser? That's the
+URL-rewriting approach that breaks Snapchat ("Browser niet ondersteund" /
+"Er is iets misgegaan"): Snapchat ties its login, cookies and security checks
+to `web.snapchat.com`. It wouldn't be faster than opening web.snapchat.com on
+the device either. On a device that can run Snapchat Web itself, opening
+web.snapchat.com directly is the only way to get truly native speed. This
+gateway is for shared, always-logged-in sessions and devices that can't.
 
 ## Optional settings
 

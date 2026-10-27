@@ -519,6 +519,7 @@ class Session extends EventEmitter {
           else if (m.t === 'mic') this._setMic(!!m.on);
           else if (m.t === 'cursor' && typeof m.c === 'string') this.broadcastJSON({ t: 'cursor', c: m.c.slice(0, 40) });
           else if (m.t === 'focus') this.broadcastJSON({ t: 'focus', editable: !!m.editable });
+          else if (m.t === 'caret') this.broadcastJSON({ t: 'caret', c: m.c || null });
         }
       }
     } finally {
@@ -614,7 +615,11 @@ class Session extends EventEmitter {
     const s = (m, p) => this.cdp.send(m, p, sid, 5000);
     const W = Math.min(640, this.screen.w);
     const H = Math.min(720, this.screen.h);
-    const mark = () => s('Overlay.highlightRect', { x: 0, y: 0, width: 4, height: 4, color: { r: 255, g: 0, b: 255, a: 1 } }).catch(() => {});
+    // 12x12 marker; we locate its bottom-right corner (a toolbar/info-bar
+    // shadow can cover the top rows of the page, never the marker's bottom)
+    const M = 12;
+    const P = Math.round(M * this.dsf);
+    const mark = () => s('Overlay.highlightRect', { x: 0, y: 0, width: M, height: M, color: { r: 255, g: 0, b: 255, a: 1 } }).catch(() => {});
     let found = null;
     try {
       await s('DOM.enable');
@@ -634,10 +639,30 @@ class Session extends EventEmitter {
           while (buf.length >= size && !done) {
             const raw = buf.subarray(0, size);
             buf = buf.subarray(size);
+            const isMark = (x, y) => {
+              if (x < 0 || y < 0 || x >= W || y >= H) return false;
+              const i = (y * W + x) * 3;
+              return raw[i] > 230 && raw[i + 1] < 40 && raw[i + 2] > 230;
+            };
             for (let i = 0; i < size; i += 3) {
               if (raw[i] > 230 && raw[i + 1] < 40 && raw[i + 2] > 230) {
                 const px = i / 3;
-                finish({ x: px % W, y: Math.floor(px / W) });
+                const x0 = px % W;
+                const y0 = Math.floor(px / W);
+                // walk to the marker's bottom and right edges
+                const cx = Math.min(W - 1, x0 + 1);
+                let yEnd = y0;
+                while (isMark(cx, yEnd + 1)) yEnd++;
+                let xEnd = x0;
+                while (isMark(xEnd + 1, yEnd - 1 >= y0 ? yEnd - 1 : yEnd)) xEnd++;
+                // the marker is square: its width (measured on an uncovered row)
+                // tells where its top really is
+                let xStart = x0;
+                const ry = yEnd - 1 >= y0 ? yEnd - 1 : yEnd;
+                while (isMark(xStart - 1, ry)) xStart--;
+                const side = xEnd - xStart + 1;
+                if (side < P / 2 || yEnd - y0 + 1 < 2) continue; // speck, not the marker
+                finish({ x: xStart, y: Math.max(0, yEnd + 1 - side) });
                 return;
               }
             }
@@ -735,6 +760,29 @@ class Session extends EventEmitter {
     }
     // A slow connection skipped frames: it needs a fresh key frame to recover.
     if (behind) { log.debug(`[${this.short}] client behind, key frame`); this._requestKeyFrame(); }
+    this._maybeAck();
+  }
+
+  // Typing preview: tell the client when a frame that contains its typed input
+  // has been sent (input dispatched >= ~2 frames ago), so it can drop its preview.
+  _maybeAck(force) {
+    const a = this.pendingAck;
+    if (!a) return;
+    if (!force && Date.now() - a.t < 45) return;
+    this.pendingAck = null;
+    clearTimeout(this.ackTimer);
+    if (a.client.ws.readyState === 1) this.sendJSON(a.client, { t: 'ack', seq: a.seq });
+  }
+
+  _noteInput(client, seq) {
+    if (!Number.isFinite(seq)) return;
+    if (!this.pendingAck) this.pendingAck = { seq, t: Date.now(), client };
+    else { this.pendingAck.seq = seq; this.pendingAck.client = client; }
+    clearTimeout(this.ackTimer);
+    this.ackTimer = setTimeout(() => this._maybeAck(true), 400); // in case no frame comes
+    // fetch the new caret position quickly instead of waiting for the next poll
+    clearTimeout(this.quickPoll);
+    this.quickPoll = setTimeout(() => this._poll(), 35);
   }
 
   _requestKeyFrame() {
@@ -793,6 +841,7 @@ class Session extends EventEmitter {
     for (const c of this.clients) {
       if (c.mode === 'jpeg' && c.ws.readyState === 1 && c.ws.bufferedAmount < 2 * 1024 * 1024) c.ws.send(buf);
     }
+    this._maybeAck();
     // Back-pressure: only ask for the next frame when clients have caught up.
     const start = Date.now();
     const tryAck = () => {
@@ -904,6 +953,7 @@ class Session extends EventEmitter {
         };
         if (m.type === 'down') {
           await send('Input.dispatchKeyEvent', { ...base, type: text ? 'keyDown' : 'rawKeyDown', text, unmodifiedText: text, autoRepeat: !!m.repeat });
+          this._noteInput(client, m.seq);
         } else {
           await send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
         }
@@ -912,6 +962,7 @@ class Session extends EventEmitter {
       case 'text':
         if (!sid || typeof m.text !== 'string' || !m.text) return;
         await send('Input.insertText', { text: m.text.slice(0, 100000) });
+        this._noteInput(client, m.seq);
         break;
       case 'resize':
         this.setViewportValues(m);
@@ -992,6 +1043,9 @@ class Session extends EventEmitter {
           log.info(`[${this.short}] viewer is slow, video now ${this.fps} fps`);
           this._updateVideo(true);
         }
+        break;
+      case 'ping':
+        this.sendJSON(client, { t: 'pong', c: m.c, fps: this.fps, transport: client.ws instanceof EventEmitter && client.ws.receive ? 'http' : 'ws' });
         break;
       case 'keyframe':
         log.debug(`[${this.short}] client asked for a key frame`);

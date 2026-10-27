@@ -18,6 +18,8 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } },
   };
   let soundOn = store.get('sound', true);
+  let predictOn = store.get('predict', true);
+  let statsOn = false;
 
   let ws = null;
   let retry = 0;
@@ -103,6 +105,9 @@
   let waitKey = true;
   let ts = 0;
   let lastSlow = 0;
+  let decodeMs = 0;
+  let framesDrawn = 0;
+  const decStart = new Map();
 
   async function detectVideo() {
     if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) return false;
@@ -129,7 +134,14 @@
           canvas.height = frame.displayHeight;
         }
         ctx.drawImage(frame, 0, 0);
+        const started = decStart.get(frame.timestamp);
+        if (started !== undefined) {
+          decStart.delete(frame.timestamp);
+          decodeMs = decodeMs ? decodeMs * 0.9 + (performance.now() - started) * 0.1 : performance.now() - started;
+        }
         frame.close();
+        framesDrawn++;
+        applyPreviewUpdates();
         if (!hasFrame) { hasFrame = true; if (ready) hideOverlay(); }
       },
       error: () => { resetDecoder(); sendJSON({ t: 'keyframe' }); },
@@ -141,15 +153,18 @@
     const key = (data[1] & 1) === 1;
     if (waitKey && !key) return;
     if (!decoder || decoder.state === 'closed') makeDecoder();
-    // Decoder can't keep up: ask for a lower frame rate; if it is far behind,
-    // skip ahead to a fresh key frame instead of showing old frames.
-    if (decoder.decodeQueueSize > 2) {
+    // Only when decoding really falls behind: ask for a lower frame rate; if it
+    // is very far behind, skip ahead to a fresh key frame instead of lagging.
+    if (decoder.decodeQueueSize > 3 && decodeMs > 60) {
       const now = performance.now();
-      if (now - lastSlow > 3000) { lastSlow = now; sendJSON({ t: 'slow' }); }
-      if (!key && decoder.decodeQueueSize > 10) { waitKey = true; sendJSON({ t: 'keyframe' }); return; }
+      if (now - lastSlow > 5000) { lastSlow = now; sendJSON({ t: 'slow' }); }
     }
+    if (!key && decoder.decodeQueueSize > 30) { waitKey = true; sendJSON({ t: 'keyframe' }); return; }
     try {
-      decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: (ts += 33333), data: data.subarray(2) }));
+      ts += 16667;
+      decStart.set(ts, performance.now());
+      if (decStart.size > 200) decStart.clear();
+      decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data: data.subarray(2) }));
       waitKey = false;
     } catch {
       resetDecoder();
@@ -171,6 +186,8 @@
       if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
       ctx.drawImage(bmp, 0, 0);
       if (bmp.close) bmp.close();
+      framesDrawn++;
+      applyPreviewUpdates();
       if (!hasFrame) { hasFrame = true; if (ready) hideOverlay(); }
     } catch { /* corrupt frame */ }
     decodingJpeg = false;
@@ -345,12 +362,16 @@
       case 'cursor': canvas.style.cursor = CURSORS.has(m.c) ? m.c : 'default'; break;
       case 'focus':
         remoteEditable = m.editable;
+        if (!m.editable) { preds = []; renderPreview(); }
         if (isTouch) {
           if (m.editable) kbd.focus({ preventScroll: true });
           else if (document.activeElement === kbd) kbd.blur();
         }
         break;
       case 'popup': $('#closepopup').hidden = !m.open; break;
+      case 'caret': pendingCaret = m.c; if (!preds.length) applyPreviewUpdates(); break;
+      case 'ack': pendingAck = Math.max(pendingAck, m.seq); break;
+      case 'pong': lastRtt = performance.now() - m.c; serverFps = m.fps; transportName = m.transport; break;
       case 'clip': copyToClipboard(m.text); break;
       case 'open': openExternal(m.url); break;
       case 'cam': if (m.on) startCamera(); else stopCamera(); break;
@@ -453,6 +474,7 @@
       return;
     }
     e.preventDefault();
+    if (preds.length) { preds = []; renderPreview(); }
     // Keep the hidden textarea focused so IME, dead keys, emoji pickers and paste work.
     if (document.activeElement !== kbd) kbd.focus({ preventScroll: true });
     canvas.setPointerCapture(e.pointerId);
@@ -549,7 +571,12 @@
     if (isTouch && e.target === kbd && isPrintable(e) && !cmd) return; // soft keyboard: input events
     if (e.key === 'F11' || e.key === 'F12') return;
     e.preventDefault();
-    sendJSON(keyMsg(e, 'down'));
+    const msg = keyMsg(e, 'down');
+    msg.seq = ++seq;
+    sendJSON(msg);
+    const altGr = e.ctrlKey && e.altKey;
+    if (isPrintable(e) && (!cmd || altGr)) predict(e.key, msg.seq);
+    else if (e.key === 'Backspace' && preds.length) { preds.pop(); renderPreview(); }
   });
   window.addEventListener('keyup', (e) => {
     if (modalOpen || !$('#menu').hidden) return;
@@ -580,13 +607,14 @@
     if (v.startsWith(SENTINEL)) {
       const parts = v.slice(SENTINEL.length).split('\n');
       parts.forEach((part, i) => {
-        if (part) sendJSON({ t: 'text', text: part });
+        if (part) { const n = ++seq; sendJSON({ t: 'text', text: part, seq: n }); predict(part, n); }
         if (i < parts.length - 1) sendKey('Enter', 'Enter', 13);
       });
     } else {
       let removed = SENTINEL.length - v.length;
       if (removed <= 0) removed = 1;
-      for (let i = 0; i < removed; i++) sendKey('Backspace', 'Backspace', 8);
+      for (let i = 0; i < removed; i++) { sendKey('Backspace', 'Backspace', 8); if (preds.length) preds.pop(); }
+      renderPreview();
     }
     resetKbd();
   }
@@ -595,6 +623,91 @@
   kbd.addEventListener('compositionend', () => { composing = false; setTimeout(flushKbd, 0); });
   kbd.addEventListener('input', () => { if (!composing) flushKbd(); });
   resetKbd();
+
+  // ------------------------------------------------------------ instant typing preview
+  // Typed letters appear at the remote caret right away (in the field's own
+  // font and colour) and are removed once a video frame containing them arrives.
+
+  let seq = 0;
+  let preds = []; // [{ seq, text }]
+  let caret = null; // { x, y, h, font, ls, color, bg, len } in remote CSS px
+  let pendingCaret;
+  let pendingAck = 0;
+  let anchorLen = null;
+  const predictEl = $('#predict');
+
+  function predict(text, n) {
+    if (!predictOn || !remoteEditable || !caret) return;
+    if (!preds.length) anchorLen = caret.len;
+    preds.push({ seq: n, text });
+    renderPreview();
+  }
+
+  // Called after each drawn video frame, so the preview only disappears once
+  // the real text is on screen.
+  function applyPreviewUpdates() {
+    let changed = false;
+    if (pendingAck) {
+      const before = preds.length;
+      preds = preds.filter((p) => p.seq > pendingAck);
+      pendingAck = 0;
+      changed = changed || before !== preds.length;
+    }
+    if (pendingCaret !== undefined) {
+      const c = pendingCaret;
+      pendingCaret = undefined;
+      // letters already in the field (caret moved past them) are no longer predictions
+      if (c && preds.length && anchorLen != null && c.len != null && c.len > anchorLen) {
+        let drop = c.len - anchorLen;
+        while (drop > 0 && preds.length) {
+          const first = preds[0];
+          if (first.text.length <= drop) { drop -= first.text.length; preds.shift(); } else { first.text = first.text.slice(drop); drop = 0; }
+        }
+      }
+      caret = c;
+      anchorLen = c ? c.len : null;
+      changed = true;
+    }
+    if (!preds.length) anchorLen = caret ? caret.len : null;
+    if (changed) renderPreview();
+  }
+
+  function renderPreview() {
+    if (!preds.length || !caret || !predictOn) { predictEl.hidden = true; return; }
+    const r = canvas.getBoundingClientRect();
+    const k = vp.w ? r.width / vp.w : 1;
+    const st = predictEl.style;
+    st.left = `${r.left + caret.x * k}px`;
+    st.top = `${r.top + caret.y * k}px`;
+    st.font = caret.font;
+    if (k !== 1) st.fontSize = `${parseFloat(getComputedStyle(predictEl).fontSize) * k}px`;
+    st.letterSpacing = caret.ls && caret.ls !== 'normal' ? caret.ls : '';
+    st.lineHeight = `${caret.h * k}px`;
+    st.height = `${caret.h * k}px`;
+    st.color = caret.color;
+    st.background = caret.bg;
+    predictEl.textContent = preds.map((p) => p.text).join('');
+    predictEl.hidden = false;
+  }
+
+  // ------------------------------------------------------------ connection info
+
+  let lastRtt = 0;
+  let serverFps = 0;
+  let transportName = '';
+  let lastFrames = 0;
+  setInterval(() => {
+    if (!statsOn) return;
+    sendJSON({ t: 'ping', c: performance.now() });
+    const fps = framesDrawn - lastFrames;
+    lastFrames = framesDrawn;
+    $('#stats').textContent =
+      `round trip  ${lastRtt ? Math.round(lastRtt) + ' ms' : '…'}\n` +
+      `video       ${fps} fps (server max ${serverFps || '?'})\n` +
+      `decode      ${mode === 'video' ? Math.round(decodeMs) + ' ms' : 'JPEG mode'}\n` +
+      `picture     ${canvas.width}×${canvas.height}\n` +
+      `connection  ${transportName === 'http' ? 'HTTP stream (proxy blocks WebSockets)' : transportName ? 'WebSocket' : '…'}`;
+  }, 1000);
 
   // ------------------------------------------------------------ popups + back button
 
@@ -610,6 +723,8 @@
 
   function openMenu() {
     $('#menu [data-act="sound"]').textContent = `Sound: ${soundOn ? 'on' : 'off'}`;
+    $('#menu [data-act="predict"]').textContent = `Instant typing preview: ${predictOn ? 'on' : 'off'}`;
+    $('#menu [data-act="stats"]').textContent = `Connection info: ${statsOn ? 'on' : 'off'}`;
     $('#menu').hidden = false;
   }
   function closeMenu() { $('#menu').hidden = true; }
@@ -620,7 +735,16 @@
     if (!btn) return;
     const act = btn.dataset.act;
     closeMenu();
-    if (act === 'sound') {
+    if (act === 'predict') {
+      predictOn = !predictOn;
+      store.set('predict', predictOn);
+      if (!predictOn) { preds = []; renderPreview(); }
+      toast(`Instant typing preview ${predictOn ? 'on' : 'off'}`);
+    } else if (act === 'stats') {
+      statsOn = !statsOn;
+      $('#stats').hidden = !statsOn;
+      if (statsOn) { $('#stats').textContent = 'measuring…'; sendJSON({ t: 'ping', c: performance.now() }); }
+    } else if (act === 'sound') {
       soundOn = !soundOn;
       store.set('sound', soundOn);
       sendJSON({ t: 'audio', on: soundOn });
