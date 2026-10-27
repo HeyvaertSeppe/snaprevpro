@@ -183,15 +183,119 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
   }
 
+  // Fallback when a proxy blocks WebSockets: same API as a WebSocket, but
+  // a long HTTP response carries server→client data and POSTs carry the rest.
+  class HttpTransport {
+    constructor(query) {
+      this.key = query.get('k') || '';
+      this.readyState = 0;
+      this.queue = [];
+      this.queued = 0;
+      this.inflight = 0;
+      this.id = null;
+      this.code = 1006;
+      this.ctrl = new AbortController();
+      this._run(query);
+    }
+
+    get bufferedAmount() { return this.queued + this.inflight; }
+
+    async _run(query) {
+      try {
+        const res = await fetch(`/stream?${query}`, { cache: 'no-store', credentials: 'same-origin', signal: this.ctrl.signal });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        const reader = res.body.getReader();
+        let buf = new Uint8Array(0);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const merged = new Uint8Array(buf.length + value.length);
+          merged.set(buf); merged.set(value, buf.length);
+          buf = merged;
+          let o = 0;
+          while (o + 5 <= buf.length) {
+            const len = ((buf[o + 1] << 24) >>> 0) + (buf[o + 2] << 16) + (buf[o + 3] << 8) + buf[o + 4];
+            if (o + 5 + len > buf.length) break;
+            const type = buf[o];
+            const payload = buf.slice(o + 5, o + 5 + len);
+            o += 5 + len;
+            if (type === 0) {
+              const text = new TextDecoder().decode(payload);
+              const m = JSON.parse(text);
+              if (m.t === 'conn') { this.id = m.id; this.readyState = 1; if (this.onopen) this.onopen(); }
+              else if (m.t === 'close') this.code = m.code;
+              else if (this.onmessage) this.onmessage({ data: text });
+            } else if (type === 1 && this.onmessage) {
+              this.onmessage({ data: payload.buffer });
+            }
+          }
+          buf = buf.slice(o);
+        }
+      } catch { /* closed or failed */ }
+      this._closed();
+    }
+
+    send(data) {
+      if (this.readyState !== 1) return;
+      const payload = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength);
+      const f = new Uint8Array(5 + payload.length);
+      f[0] = typeof data === 'string' ? 0 : 1;
+      new DataView(f.buffer).setUint32(1, payload.length);
+      f.set(payload, 5);
+      this.queue.push(f);
+      this.queued += f.length;
+      this._flush();
+    }
+
+    // One POST in flight at a time; everything sent meanwhile goes in the next one.
+    async _flush() {
+      if (this.inflight || !this.queue.length || this.readyState !== 1) return;
+      const body = new Blob(this.queue);
+      this.inflight = this.queued;
+      this.queue = [];
+      this.queued = 0;
+      try {
+        const res = await fetch(`/send?id=${this.id}&k=${encodeURIComponent(this.key)}`, { method: 'POST', body, credentials: 'same-origin', cache: 'no-store' });
+        if (res.status === 410) this.close();
+      } catch { /* the stream will notice */ }
+      this.inflight = 0;
+      this._flush();
+    }
+
+    close() { this.ctrl.abort(); this._closed(); }
+
+    _closed() {
+      if (this.readyState === 3) return;
+      const opened = this.readyState === 1;
+      this.readyState = 3;
+      if (this.onclose) this.onclose({ code: this.code, opened });
+    }
+  }
+
+  // Transport choice: WebSocket first; if it can't connect twice (proxy
+  // without WebSocket support), use HTTP streaming for this page load.
+  let wsFailures = 0;
+
   function connect() {
     const w = wanted();
     let tz = '';
     try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { /* ignore */ }
-    const q = new URLSearchParams({ w: w.w, h: w.h, dsf: w.dsf, lang: navigator.language || 'en-US', tz, mode, touch: isTouch ? 1 : 0 });
-    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?${q}`);
-    ws.binaryType = 'arraybuffer';
+    const keyMeta = document.querySelector('meta[name="rb-key"]');
+    const q = new URLSearchParams({ w: w.w, h: w.h, dsf: w.dsf, lang: navigator.language || 'en-US', tz, mode, touch: isTouch ? 1 : 0, k: keyMeta ? keyMeta.content : '' });
+    const useHttp = wsFailures >= 2;
+    let opened = false;
+    if (useHttp) {
+      ws = new HttpTransport(q);
+    } else {
+      ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?${q}`);
+      ws.binaryType = 'arraybuffer';
+    }
+    const thisWs = ws;
     ws.onopen = () => {
+      opened = true;
+      window.__transport = useHttp ? 'http-stream' : 'websocket';
       retry = 0;
+      if (!useHttp) wsFailures = 0;
       sendJSON({ t: 'resize', ...wanted() });
       sendJSON({ t: 'audio', on: soundOn });
     };
@@ -203,6 +307,8 @@
       else if (data[0] === MSG.AUDIO) playAudio(data.subarray(1));
     };
     ws.onclose = (e) => {
+      if (thisWs !== ws) return;
+      if (!opened && !useHttp) wsFailures++;
       ready = false;
       resetDecoder();
       stopCamera();
@@ -212,8 +318,11 @@
         setTimeout(connect, 30000);
         return;
       }
-      showOverlay(e.code === 4000 ? 'Restarting…' : 'Reconnecting…');
-      setTimeout(connect, e.code === 4000 ? 800 : Math.min(8000, 400 * 2 ** retry++));
+      if (e.code === 4000) showOverlay('Restarting…');
+      else if (!navigator.onLine) showOverlay('No internet connection. Waiting…');
+      else if (retry >= 4 && !opened) showOverlay('Can\'t reach the server. Retrying…');
+      else showOverlay('Reconnecting…');
+      setTimeout(connect, e.code === 4000 ? 800 : (!opened && !useHttp && wsFailures < 2) ? 300 : Math.min(8000, 400 * 2 ** retry++));
     };
   }
 
@@ -571,9 +680,20 @@
       try {
         const ids = [];
         for (const f of files) {
-          const res = await fetch('/upload', { method: 'POST', body: f, headers: { 'X-Filename': encodeURIComponent(f.name) }, credentials: 'same-origin' });
-          if (!res.ok) throw new Error(await res.text());
-          ids.push((await res.json()).id);
+          // 512 KB chunks: passes proxies with small upload limits
+          const CHUNK = 512 * 1024;
+          const upId = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+          const total = Math.max(1, Math.ceil(f.size / CHUNK));
+          let result = null;
+          for (let i = 0; i < total; i++) {
+            const res = await fetch('/upload', {
+              method: 'POST', body: f.slice(i * CHUNK, (i + 1) * CHUNK), credentials: 'same-origin',
+              headers: { 'X-Filename': encodeURIComponent(f.name), 'X-Upload-Id': upId, 'X-Chunk': String(i), 'X-Last': i === total - 1 ? '1' : '0' },
+            });
+            if (!res.ok) throw new Error(await res.text());
+            result = await res.json();
+          }
+          ids.push(result.id);
         }
         sendJSON({ t: 'files', id: m.id, files: ids });
         toast('Uploaded');

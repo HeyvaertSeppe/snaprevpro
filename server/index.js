@@ -11,6 +11,7 @@ const config = require('./config');
 const log = require('./log');
 const pulse = require('./pulse');
 const { Session, userDir, uploadDir } = require('./session');
+const httpstream = require('./httpstream');
 
 const PUBLIC = path.join(__dirname, '..', 'public');
 const COOKIE = 'rb_uid';
@@ -32,6 +33,10 @@ function loadSecret() {
 
 const sign = (uid) => crypto.createHmac('sha256', secret).update(uid).digest('hex').slice(0, 32);
 const tokenFor = (uid) => `${uid}.${sign(uid)}`;
+// Per-device key embedded in the page; the live connection presents it.
+// Other websites can't read our page, so a valid key proves the request
+// comes from this site even when a proxy rewrites Host/Origin.
+const pageKey = (uid) => crypto.createHmac('sha256', secret).update(`page:${uid}`).digest('hex').slice(0, 24);
 
 function verifyToken(token) {
   const m = /^([a-f0-9]{32})\.([a-f0-9]{32})$/.exec(token || '');
@@ -53,7 +58,9 @@ function parseCookies(req) {
 const userFromReq = (req) => verifyToken(parseCookies(req)[COOKIE]);
 
 function isHttps(req) {
-  return req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  if (req.socket.encrypted) return true;
+  if (String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https') return true;
+  return /"scheme":"https"/.test(String(req.headers['cf-visitor'] || '')); // Cloudflare
 }
 
 function cookieHeader(req, uid) {
@@ -81,6 +88,18 @@ const TYPES = { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; char
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { ...SECURITY_HEADERS, ...headers });
   res.end(body);
+}
+
+// index.html with ?v=<hash> on the app files, so browsers/CDNs (Cloudflare)
+// never mix an old app.js with a new server after an update.
+let indexHtml = null;
+function getIndexHtml() {
+  if (indexHtml) return indexHtml;
+  const ver = (name) => crypto.createHash('sha1').update(fs.readFileSync(path.join(PUBLIC, 'assets', name))).digest('hex').slice(0, 10);
+  indexHtml = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8')
+    .replace('/assets/app.js', `/assets/app.js?v=${ver('app.js')}`)
+    .replace('/assets/style.css', `/assets/style.css?v=${ver('style.css')}`);
+  return indexHtml;
 }
 
 function serveFile(res, file, extra = {}) {
@@ -132,7 +151,8 @@ async function handle(req, res) {
       uid = newUser();
       headers['Set-Cookie'] = cookieHeader(req, uid);
     }
-    return serveFile(res, path.join(PUBLIC, 'index.html'), { ...headers, 'Cache-Control': 'no-store' });
+    const html = getIndexHtml().replace('<head>', `<head>\n  <meta name="rb-key" content="${pageKey(uid)}">`);
+    return send(res, 200, html, { ...headers, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   }
 
   if (p === '/login' && req.method === 'POST' && config.accessCode) {
@@ -155,8 +175,38 @@ async function handle(req, res) {
     return send(res, 303, '', { Location: '/', 'Set-Cookie': cookieHeader(req, uid), 'Cache-Control': 'no-store' });
   }
 
+  // /ws reached here = a proxy dropped the WebSocket "Upgrade" header.
+  if (p === '/ws') {
+    warnOnce('ws-no-upgrade', 'A request for /ws arrived without WebSocket upgrade headers: the reverse proxy is not forwarding WebSockets. Clients fall back to HTTP streaming (works, slightly slower). See nginx/ in the README to fix the proxy.');
+    return send(res, 426, 'WebSocket upgrade required', { Upgrade: 'websocket' });
+  }
+
   const uid = userFromReq(req);
   if (!uid) return send(res, 401, 'Not signed in');
+
+  // HTTP streaming fallback (see httpstream.js)
+  if (p === '/stream' && req.method === 'GET') {
+    if (!originOk(req, uid)) return send(res, 403, 'Forbidden');
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'Content-Type': 'application/octet-stream',
+      'Cache-Control': 'no-store, no-transform',
+      'X-Accel-Buffering': 'no', // tell Nginx not to buffer this response
+    });
+    req.socket.setNoDelay(true);
+    req.socket.setTimeout(0);
+    const conn = new httpstream.HttpStreamConn(res, uid);
+    openClient(conn, uid, url.searchParams);
+    return undefined;
+  }
+  if (p === '/send' && req.method === 'POST') {
+    if (!originOk(req, uid)) return send(res, 403, 'Forbidden');
+    const conn = httpstream.get(url.searchParams.get('id'), uid);
+    const body = await readBody(req, 8 * 1024 * 1024).catch(() => null);
+    if (!conn) return send(res, 410, 'Gone');
+    if (body) conn.receive(body);
+    return send(res, 204, '');
+  }
 
   if (p === '/api/link') {
     return send(res, 200, JSON.stringify({ path: `/claim/${tokenFor(uid)}` }), { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -168,10 +218,17 @@ async function handle(req, res) {
     let name = 'file';
     try { name = decodeURIComponent(String(req.headers['x-filename'] || 'file')); } catch { /* keep default */ }
     name = path.basename(name).replace(/[^\w.\- ()[\]]+/g, '_').slice(-120) || 'file';
-    const id = `${crypto.randomBytes(6).toString('hex')}-${name}`;
+    // Big files arrive in chunks (X-Upload-Id / X-Chunk / X-Last) so they pass
+    // proxies with small body limits (Nginx default 1 MB, Cloudflare 100 MB).
+    const upId = /^[a-f0-9]{8,32}$/.test(String(req.headers['x-upload-id'] || '')) ? req.headers['x-upload-id'] : crypto.randomBytes(6).toString('hex');
+    const chunk = Number(req.headers['x-chunk'] || 0) | 0;
+    const last = req.headers['x-last'] === undefined || req.headers['x-last'] === '1';
+    const id = `${upId}-${name}`;
     const file = path.join(dir, id);
-    const out = fs.createWriteStream(file);
-    let size = 0;
+    let already = 0;
+    if (chunk > 0) { try { already = fs.statSync(file).size; } catch { return send(res, 409, 'Upload out of order'); } }
+    const out = fs.createWriteStream(file, { flags: chunk > 0 ? 'a' : 'w' });
+    let size = already;
     let failed = false;
     req.on('data', (c) => {
       size += c.length;
@@ -184,7 +241,7 @@ async function handle(req, res) {
       }
     });
     req.pipe(out);
-    out.on('finish', () => { if (!failed) send(res, 200, JSON.stringify({ id }), { 'Content-Type': 'application/json' }); });
+    out.on('finish', () => { if (!failed) send(res, 200, JSON.stringify(last ? { id } : { ok: true }), { 'Content-Type': 'application/json' }); });
     out.on('error', () => { if (!failed) { failed = true; send(res, 500, 'Upload failed'); } });
     return undefined;
   }
@@ -229,16 +286,51 @@ function getSession(uid, hints) {
   return s;
 }
 
-function originOk(req) {
+const warned = new Set();
+function warnOnce(key, msg) {
+  if (warned.has(key)) return;
+  warned.add(key);
+  log.warn(msg);
+}
+
+// Cross-site protection: the page's origin must be this site. Proxies and
+// tunnels (Nginx, Cloudflare) may change the Host/port, so compare host names
+// against every host header they might set.
+function originOk(req, uid) {
   const origin = req.headers.origin;
-  if (!origin) return true;
-  try {
-    const host = new URL(origin).host;
-    const allowed = [req.headers.host, req.headers['x-forwarded-host']].filter(Boolean).flatMap((h) => String(h).split(',')).map((h) => h.trim());
-    return allowed.includes(host);
-  } catch {
-    return false;
+  if (!origin || origin === 'null') return true;
+  if (uid) {
+    const k = new URL(req.url, 'http://x').searchParams.get('k') || '';
+    const want = pageKey(uid);
+    if (k.length === want.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(want))) return true;
   }
+  let host = '';
+  try { host = new URL(origin).hostname.toLowerCase(); } catch { return false; }
+  const candidates = [req.headers.host, req.headers['x-forwarded-host'], req.headers['x-original-host']]
+    .filter(Boolean).flatMap((h) => String(h).split(','))
+    .map((h) => h.trim().toLowerCase().replace(/:\d+$/, '').replace(/^\[|\]$/g, ''));
+  if (candidates.includes(host)) return true;
+  // Behind a tunnel/proxy that rewrites Host (e.g. a Cloudflare tunnel pointed at
+  // an IP address) the names differ. The browser itself says whether the
+  // request comes from this same site; page scripts cannot fake this header.
+  const site = String(req.headers['sec-fetch-site'] || '');
+  if (site === 'same-origin' || site === 'same-site') {
+    warnOnce('host-mismatch', `Note: the proxy does not pass the original Host header (got "${req.headers.host}", site is "${host}"). This works, but "proxy_set_header Host $host;" (Nginx) or "HTTP Host Header" (Cloudflare tunnel) is cleaner.`);
+    return true;
+  }
+  warnOnce(`origin-${host}`, `Refused a connection from origin "${origin}" (Host: ${req.headers.host}, X-Forwarded-Host: ${req.headers['x-forwarded-host'] || '-'}). Make the proxy pass the original Host header ("proxy_set_header Host $host;" in Nginx).`);
+  return false;
+}
+
+// Attach a client (WebSocket or HTTP stream) to the user's browser session.
+function openClient(conn, uid, q) {
+  const session = getSession(uid, { w: q.get('w'), h: q.get('h'), dsf: q.get('dsf'), lang: q.get('lang'), tz: q.get('tz'), touch: q.get('touch') });
+  if (!session) {
+    conn.send(JSON.stringify({ t: 'status', state: 'busy', message: 'The server is full right now. Please try again in a few minutes.' }));
+    conn.close(4001, 'busy');
+    return;
+  }
+  session.attach(conn, q.get('mode'));
 }
 
 // ------------------------------------------------------------------ boot
@@ -262,21 +354,15 @@ async function main() {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://x');
     const uid = url.pathname === '/ws' ? userFromReq(req) : null;
-    if (!uid || !originOk(req)) {
+    if (!uid || !originOk(req, uid)) {
+      if (url.pathname === '/ws' && !uid) warnOnce('ws-nocookie', 'Refused a WebSocket without a valid device cookie (the proxy may be stripping the Cookie header).');
       socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.isAlive = true;
       ws.on('pong', () => { ws.isAlive = true; });
-      const q = url.searchParams;
-      const session = getSession(uid, { w: q.get('w'), h: q.get('h'), dsf: q.get('dsf'), lang: q.get('lang'), tz: q.get('tz'), touch: q.get('touch') });
-      if (!session) {
-        ws.send(JSON.stringify({ t: 'status', state: 'busy', message: 'The server is full right now. Please try again in a few minutes.' }));
-        ws.close(4001, 'busy');
-        return;
-      }
-      session.attach(ws, q.get('mode'));
+      openClient(ws, uid, url.searchParams);
     });
   });
 

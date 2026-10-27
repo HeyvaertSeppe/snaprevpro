@@ -6,7 +6,7 @@
 // That region is captured and streamed as H.264 video (video.js), decoded on
 // the visitor's device with WebCodecs. Browsers without WebCodecs get the
 // older JPEG stream (CDP screencast). Input is replayed with CDP Input.*.
-const { spawn, execFile } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
@@ -20,6 +20,8 @@ const { X11H264 } = require('./video');
 const MSG = { FRAME: 1, AUDIO: 2, VIDEO: 3, CAM: 0x10, MIC: 0x11 };
 // Room (CSS px) above the page for Chromium's own tab/tool bar, which is never shown.
 const UI_ROOM = 160;
+// Page position on the virtual screen, per pixel density, as last measured.
+const knownOffsets = new Map();
 
 const usedDisplays = new Set();
 function allocDisplay() {
@@ -602,39 +604,50 @@ class Session extends EventEmitter {
     }
   }
 
-  // Find where the page's top-left corner is on the X screen (the kiosk
-  // window position and any info bar can shift it by a few pixels):
-  // draw a magenta marker with the DevTools overlay and look for it.
+  // Find where the page's top-left corner is on the X screen (the window
+  // position and Chromium's own bars shift it): draw a magenta marker with the
+  // DevTools overlay and look for it in a short capture of the screen corner.
   async _calibrate() {
     const page = this.active && this.pages.get(this.active);
     if (!page) return;
     const sid = page.sid;
     const s = (m, p) => this.cdp.send(m, p, sid, 5000);
+    const W = Math.min(640, this.screen.w);
+    const H = Math.min(720, this.screen.h);
+    const mark = () => s('Overlay.highlightRect', { x: 0, y: 0, width: 4, height: 4, color: { r: 255, g: 0, b: 255, a: 1 } }).catch(() => {});
     let found = null;
     try {
       await s('DOM.enable');
       await s('Overlay.enable');
-      const W = 640;
-      const H = 640;
-      for (let attempt = 0; attempt < 15 && !found && !this.closing; attempt++) {
-        await s('Overlay.highlightRect', { x: 0, y: 0, width: 4, height: 4, color: { r: 255, g: 0, b: 255, a: 1 } });
-        await wait(attempt ? 200 : 100);
-        const raw = await new Promise((resolve) => {
-          execFile('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-video_size', `${W}x${H}`,
-            '-i', `:${this.display}.0+0,0`, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
-          { encoding: 'buffer', maxBuffer: 8 * 1024 * 1024, timeout: 5000 }, (err, out) => {
-            if (err) log.debug('calibrate capture:', err.message.slice(0, 200));
-            resolve(err ? null : out);
-          });
-        });
-        if (!raw) continue;
-        for (let y = 0; y < H && !found; y++) {
-          for (let x = 0; x < W; x++) {
-            const i = (y * W + x) * 3;
-            if (raw[i] > 230 && raw[i + 1] < 40 && raw[i + 2] > 230) { found = { x, y }; break; }
+      await mark();
+      const remark = setInterval(mark, 400); // the page may still be loading/repainting
+      found = await new Promise((resolve) => {
+        const ff = spawn('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-framerate', '10',
+          '-video_size', `${W}x${H}`, '-i', `:${this.display}.0+0,0`, '-t', '8', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+        { stdio: ['ignore', 'pipe', 'ignore'] });
+        const size = W * H * 3;
+        let buf = Buffer.alloc(0);
+        let done = false;
+        const finish = (v) => { if (done) return; done = true; ff.kill('SIGKILL'); resolve(v); };
+        ff.stdout.on('data', (chunk) => {
+          buf = Buffer.concat([buf, chunk]);
+          while (buf.length >= size && !done) {
+            const raw = buf.subarray(0, size);
+            buf = buf.subarray(size);
+            for (let i = 0; i < size; i += 3) {
+              if (raw[i] > 230 && raw[i + 1] < 40 && raw[i + 2] > 230) {
+                const px = i / 3;
+                finish({ x: px % W, y: Math.floor(px / W) });
+                return;
+              }
+            }
           }
-        }
-      }
+        });
+        ff.on('exit', () => finish(null));
+        ff.on('error', () => finish(null));
+        setTimeout(() => finish(null), 9000);
+      });
+      clearInterval(remark);
     } catch (e) {
       log.debug('calibrate:', e.message);
     } finally {
@@ -642,18 +655,23 @@ class Session extends EventEmitter {
       await s('Overlay.disable').catch(() => {});
       await s('DOM.disable').catch(() => {});
     }
-    const even = (v) => Math.max(2, Math.floor(v / 2) * 2);
-    const pos = found || (this.region ? { x: this.region.x, y: this.region.y } : { x: 0, y: 0 });
-    if (!found && !this.closing) {
+    if (found) knownOffsets.set(this.dsf, found);
+    else if (!this.closing) {
       log.warn(`[${this.short}] could not locate page on screen yet; retrying soon`);
       setTimeout(() => { this.needCalibration = true; this._updateVideo(true); }, 3000);
     }
+    const pos = found || (this.region && { x: this.region.x, y: this.region.y }) || knownOffsets.get(this.dsf) || { x: 0, y: 0 };
+    this._setRegion(pos);
+    log.debug(`[${this.short}] page region`, JSON.stringify(this.region), found ? '' : '(guessed)');
+  }
+
+  _setRegion(pos) {
+    const even = (v) => Math.max(2, Math.floor(v / 2) * 2);
     this.region = {
       x: pos.x, y: pos.y,
       w: even(Math.min(this.viewport.w * this.dsf, this.screen.w - pos.x)),
       h: even(Math.min(this.viewport.h * this.dsf, this.screen.h - pos.y)),
     };
-    log.debug(`[${this.short}] page region`, JSON.stringify(this.region));
   }
 
   // (Re)start or stop the H.264 encoder depending on who is watching.
@@ -664,14 +682,25 @@ class Session extends EventEmitter {
     clearTimeout(this.videoTimer);
     this.videoTimer = setTimeout(async () => {
       if (this.calibrating) { this._updateVideo(true); return; }
-      this.calibrating = true;
-      try {
-        if (!this.region || this.needCalibration) {
-          this.needCalibration = false;
-          await this._calibrate();
+      // First stream of this browser: start right away at the position measured
+      // for an earlier browser (same layout), then verify it in the background.
+      if (!this.region && knownOffsets.has(this.dsf)) {
+        this._setRegion(knownOffsets.get(this.dsf));
+        this.needCalibration = true;
+        setTimeout(() => this._updateVideo(true), 1500);
+      } else {
+        this.calibrating = true;
+        try {
+          if (!this.region || this.needCalibration) {
+            this.needCalibration = false;
+            const before = JSON.stringify(this.region);
+            await this._calibrate();
+            // nothing moved and the stream is running: keep it
+            if (this.encoder && before === JSON.stringify(this.region)) return;
+          }
+        } finally {
+          this.calibrating = false;
         }
-      } finally {
-        this.calibrating = false;
       }
       if (this.closing || !this.region) return;
       this._stopEncoder();

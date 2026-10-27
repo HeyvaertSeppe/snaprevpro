@@ -63,35 +63,67 @@ Options: `CTID=120 CORES=10 RAM_MB=20480 DISK_GB=40 BRIDGE=vmbr0 STORAGE=local-l
 IP=192.168.1.77/24 GW=192.168.1.1 bash install-ct.sh` (all optional; a fixed IP
 is recommended so the FastPanel address never changes).
 
-## FastPanel setup (web.heyvaertseppe.be)
+## Reverse proxy / Cloudflare tunnel
 
-The backend address is **`http://127.0.0.1:3080`**: the container is on the same
-server as FastPanel and only listens on localhost. If Nginx runs on a different
-machine, change the port mapping to `"3080:8080"` and use that machine's LAN IP
-(e.g. `http://192.168.1.50:3080`).
+Everything goes over **one HTTPS port (443)**: the page, the live connection
+(WebSocket, with an automatic HTTP-stream fallback) and uploads. Devices are
+identified by their cookie, never by IP address.
 
-1. **DNS**: point an `A` record for `web.heyvaertseppe.be` to your public IP,
-   and forward ports 80 and 443 on your router to the server (as for your other sites).
-2. **Create the site** in FastPanel: *Sites → Create site*, domain
-   `web.heyvaertseppe.be`. If your FastPanel offers a *Reverse proxy* /
-   *Proxy* site type, choose it and enter `http://127.0.0.1:3080`. Otherwise
-   create a normal site; step 4 replaces its config anyway.
-3. **SSL**: on the site, open *SSL certificates → Let's Encrypt*, issue the
-   certificate, and turn on *Redirect HTTP to HTTPS* (and HTTP/2).
-4. **Nginx config**: open the site's *Configuration files* (the Nginx one) and
-   replace the `location / { ... }` block with the three `location` blocks
-   from [`nginx/web.heyvaertseppe.be.conf`](nginx/web.heyvaertseppe.be.conf)
-   (between "copy from here" and "copy until here"). Also **remove** any
-   static-file block such as `location ~* ^.+\.(jpg|jpeg|gif|png|css|js|…)$`;
-   it would try to serve the app's files from disk. Add
-   `client_max_body_size 250m;` to the server block if FastPanel has a smaller
-   value. Save; FastPanel tests and reloads Nginx.
-5. Visit `https://web.heyvaertseppe.be`. The first visit takes a few seconds while
-   your browser starts. Log into Snapchat once, and you stay logged in.
+If a proxy blocks WebSockets, the page **still works**: it switches to an
+HTTP stream by itself (and the container log says so). WebSockets are a bit
+smoother, so it's worth enabling them as below.
 
-What the Nginx config handles: SSL termination, the WebSocket upgrade on `/ws`
-with a 1-day timeout, unbuffered uploads, and a `Permissions-Policy` header that
-allows camera, microphone and clipboard on this site.
+### FastPanel (Nginx)
+
+Keep the site config FastPanel generated (`location /` with
+`proxy_pass http://<upstream>;` + `include /etc/nginx/proxy_params;`). Add the
+WebSocket support in the site's **includes file**, which FastPanel never
+overwrites:
+
+1. Copy [`nginx/fastpanel-includes.conf`](nginx/fastpanel-includes.conf) into
+   `/etc/nginx/fastpanel2-sites/fastuser/web.heyvaertseppe.be.includes`
+   (change `10.1.3.241:3080` if your container has another address).
+2. `nginx -t && systemctl reload nginx`
+
+It adds `location /ws` (HTTP/1.1 + `Upgrade` headers, no timeout),
+`location /stream` (unbuffered), `location ^~ /assets/` (so the app files never
+come from FastPanel's static-file rule) and `client_max_body_size 250m`.
+FastPanel's plain `proxy_params` has none of these, which is what causes an
+endless "Reconnecting…" with older versions of this app.
+
+### Cloudflare tunnel
+
+In Cloudflare Zero Trust → *Networks → Tunnels → your tunnel → Public
+hostname*, add `web.heyvaertseppe.be` with **one** of these services:
+
+* **Recommended, directly to the container** (skips Nginx, fewest hops):
+  Type `HTTP`, URL `10.1.3.241:3080`.
+* **Through FastPanel's Nginx**: type `HTTP`, URL `10.1.2.222:80`, and under
+  *Additional application settings → HTTP Settings* set **HTTP Host Header**
+  to `web.heyvaertseppe.be`. (With type `HTTPS` → `10.1.2.222:443`, also set
+  *Origin Server Name* `web.heyvaertseppe.be` or enable *No TLS Verify*.)
+
+In the Cloudflare dashboard for the domain:
+
+* *Network* → **WebSockets: On** (default)
+* *Speed → Optimization* → **Rocket Loader: Off** (it rewrites the page's script)
+* *SSL/TLS* → *Edge Certificates* → **Always Use HTTPS: On** (camera and mic need HTTPS)
+
+No cache rules are needed: the page is sent as `no-store`, and app files carry
+a version (`app.js?v=…`), so an update never mixes old and new code.
+
+### Without Cloudflare (port forwarding)
+
+Point an `A` record at your public IP, forward 80/443 to the FastPanel server,
+issue a Let's Encrypt certificate for the site in FastPanel, and add the
+includes file as above. A complete stand-alone Nginx server block is in
+[`nginx/web.heyvaertseppe.be.conf`](nginx/web.heyvaertseppe.be.conf).
+
+### Still "Reconnecting…"?
+
+Run `docker compose logs --tail 50` in `/opt/snaprevpro`. The gateway logs one
+clear line for each proxy problem it sees: WebSocket headers missing, Host
+header rewritten, or Cookie header stripped.
 
 ## How it works
 
@@ -199,6 +231,7 @@ Rebuild every few weeks so Chromium stays current; Snapchat may reject old brows
 server/index.js      HTTP + WebSocket gateway, device cookies, uploads/downloads
 server/session.js    one user's Xvfb + PulseAudio devices + Chromium, page placement, input
 server/video.js      ffmpeg x11grab → H.264 encoder, split into frames for WebCodecs
+server/httpstream.js HTTP streaming fallback when a proxy blocks WebSockets
 server/inject.js     script injected into pages: virtual camera, mic signalling, clipboard
 server/cdp.js        tiny Chrome DevTools Protocol client over --remote-debugging-pipe
 server/pulse.js      PulseAudio daemon + per-user sink/source
