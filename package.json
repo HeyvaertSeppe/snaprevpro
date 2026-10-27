@@ -1,0 +1,17 @@
+{
+  "name": "snaprevpro",
+  "version": "1.0.0",
+  "description": "Self-hosted multi-user remote browser gateway (one isolated, persistent Chromium per device) for web apps like Snapchat Web.",
+  "main": "server/index.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

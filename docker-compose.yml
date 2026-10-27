@@ -1,0 +1,21 @@
+services:
+  web-gateway:
+    build: .
+    image: snaprevpro:latest
+    container_name: snaprevpro
+    restart: unless-stopped
+    init: false            # tini is already the entrypoint
+    ports:
+      # FastPanel's Nginx on the same server proxies to 127.0.0.1:3080.
+      # (Use "3080:8080" instead if Nginx runs on another machine.)
+      - "127.0.0.1:3080:8080"
+    volumes:
+      - ./data:/data       # browser profiles = everyone's logins; back this up
+    shm_size: "1gb"
+    stop_grace_period: 30s # gives every browser time to save its profile
+    # Optional settings (all have defaults, nothing is required):
+    # environment:
+    #   - MAX_SESSIONS=8        # browsers running at the same time
+    #   - IDLE_TIMEOUT_MIN=15   # stop a browser N minutes after its tab closed
+    #   - ACCESS_CODE=          # set a code to require it once per new device
+    #   - START_URL=https://web.snapchat.com/
