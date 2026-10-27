@@ -15,8 +15,14 @@ persistent browser, so you log in once and stay logged in.
 
 Snapchat runs in a real, unmodified Chromium, so it doesn't break the way
 URL-rewriting proxies do. WebSockets, IndexedDB, WebCrypto, service workers and
-WebRTC all work as in a normal browser. Your device only shows a video-like
-stream of the page and sends back your clicks, taps and keys.
+WebRTC all work as in a normal browser.
+
+The page fills your whole screen, with no toolbar or address bar. It is rendered
+on the server at your screen's exact size and pixel density (e.g. 2× on a
+retina laptop, ~2.6× on a phone) and sent as a **low-latency H.264 video
+stream (up to 60 fps)**, which your browser decodes with its built-in
+hardware decoder. Your clicks, taps and keys go back the same way. Everything,
+video included, runs over the normal HTTPS connection on **port 443 only**.
 
 ## Quick start
 
@@ -91,7 +97,7 @@ allows camera, microphone and clipboard on this site.
 
 | Requirement | How |
 |---|---|
-| Same URL for everyone | One domain and path. A signed `rb_uid` cookie (HttpOnly, 10 years) identifies the device. |
+| Same URL for everyone | One domain and path. A signed `rb_uid` cookie (HttpOnly, 10 years) identifies the device, **never the IP address**, so any number of people behind the same home IP each get their own session. |
 | Automatic provisioning | First visit: random ID, signed cookie, new profile dir `data/users/<id>/`. Nothing to configure. |
 | Isolation | Each device gets its own Chromium process, its own profile directory, its own X display and its own audio devices. Screens and inputs are never shared. |
 | Persistent login | The Chromium profile (cookies, IndexedDB, service workers, local storage) lives in `./data`. Browsers are shut down gracefully on idle or `docker stop`, so everything is flushed to disk. Tested: logins survive browser restarts and container restarts. |
@@ -101,27 +107,36 @@ allows camera, microphone and clipboard on this site.
 | Sound | Each browser plays into its own PulseAudio sink, which is streamed to you. Tap the 🔊 button to mute. |
 | Clipboard | Ctrl/Cmd+V pastes your local text into the page. Copying in the page puts the text on your clipboard. |
 | Files | Upload buttons in the page open your device's file picker. Downloads are delivered to your device. |
-| Tabs/popups | Shown as tabs in the toolbar. |
-| Phones | Tap = click, drag = scroll, long-press = right-click, ⌨ button = keyboard. Narrow screens get a scaled desktop layout. |
+| Picture | Chromium renders the page at your exact CSS size and device pixel ratio. The region is captured from the virtual screen and encoded with x264 (`zerolatency`, no B-frames) at up to 60 fps; your browser decodes it with WebCodecs. If your device can't keep up, the frame rate drops automatically. Browsers without WebCodecs fall back to a JPEG stream. |
+| Cursor | Drawn by your own device (no lag); its shape follows the page (pointer, text, …). |
+| Links | A link to another website that opens a new window opens **on your own device** instead. A Snapchat popup shows a small ✕ to close it; your phone's/browser's back button also closes it (or goes back inside the page). |
+| Phones | Native size and sharpness. Tap = click, swipe = scroll (with momentum), long-press = right-click. Tapping a text field opens your keyboard (on iPhone you may need to tap the field a second time). |
 | Detection | Real Chromium, `navigator.webdriver` is false, no CDP `Runtime.enable`; the page sees a normal Chrome on Linux. |
 
-### Toolbar
+Tip: on a phone, use "Add to Home screen" and open it from there. It then
+runs full screen like an app.
 
-Back · Forward · Reload · Home · tabs · ⌨ (touch only) · 🔊 sound · **HD** (sharper
-text on high-DPI screens, more bandwidth) · full screen · ⋯ menu:
+### Hidden menu
+
+There's no visible UI. A hidden menu opens with **Ctrl+Alt+Shift+M**, a
+**three-finger tap**, or by opening `https://web.heyvaertseppe.be/#menu`:
 
 * **Use this session on another device…** gives a private link that moves your
   login to another device. Anyone with this link can use your account, so don't share it.
 * **Restart my browser**: use it if the page gets stuck. You stay logged in.
-* **Hide toolbar**: a small arrow at the top right brings it back.
+* **Sound on/off**
 
 ## Resources
 
 Measured in the container on a simple test page:
 
 * Gateway with nobody connected: **~20 MB**.
-* Each **active** user: **~300 MB** extra (Chromium shares its code pages between users).
-  Snapchat itself is heavier than the test page, so plan for **~400–600 MB per active user**.
+* Each **active** user: **~450 MB** on a 2× (retina) screen. Rendering at full
+  sharpness costs more than a low-resolution picture would. Snapchat is heavier
+  than the test page, so plan for **~600–800 MB per active user**.
+* CPU: rendering plus video encoding uses roughly **1–2.5 cores per user while
+  something moves** and close to zero on a still screen. Set `FPS=30` to halve
+  the encoding work.
 * Users who closed the tab cost **0 MB**: their browser is stopped after
   `IDLE_TIMEOUT_MIN` (15 min) and restarted with the same profile on the next visit (~2–4 s).
 
@@ -131,8 +146,13 @@ the site is already on (see `chromeFlags` in `server/session.js`). The idle
 shutdown is what keeps total RAM low. `MAX_SESSIONS` (default 8) caps how many run at once.
 When full, the least-recently-used browser that nobody is looking at is stopped.
 
-Bandwidth: screen updates are JPEG frames sent only when something changes,
-typically 0.2–3 Mbit/s while active.
+Bandwidth: under 0.5 Mbit/s on a still page, typically 2–8 Mbit/s while
+scrolling or watching video (capped by `VIDEO_MAX_MBIT`).
+
+**Latency**: what you feel is your network round-trip plus about 30–60 ms
+(capture, encode, decode). On the same Wi-Fi as the server that's near-instant.
+Over 4G it feels like a fast remote desktop. It can never be exactly as instant
+as running Snapchat on the device itself.
 
 ## Optional settings
 
@@ -144,7 +164,11 @@ All optional. Set them under `environment:` in `docker-compose.yml`.
 | `IDLE_TIMEOUT_MIN` | `15` | Stop a browser N minutes after its last tab closed |
 | `ACCESS_CODE` | *(empty)* | If set, a new device must type this code once |
 | `START_URL` | `https://web.snapchat.com/` | Page each browser opens |
-| `JPEG_QUALITY` | `70` | Stream quality (10–95) |
+| `FPS` | `60` | Video frames per second (lower = less CPU/bandwidth) |
+| `VIDEO_CRF` | `20` | Video quality: lower = sharper, more bandwidth (18–28 sensible) |
+| `VIDEO_MAX_MBIT` | `12` | Bandwidth cap per viewer |
+| `X264_PRESET` | `superfast` | Encoder speed/quality (`ultrafast` = least CPU) |
+| `JPEG_QUALITY` | `80` | Quality of the fallback stream for old browsers |
 | `MAX_UPLOAD_MB` | `250` | Upload size limit |
 
 ## Security notes
@@ -173,10 +197,11 @@ Rebuild every few weeks so Chromium stays current; Snapchat may reject old brows
 
 ```
 server/index.js      HTTP + WebSocket gateway, device cookies, uploads/downloads
-server/session.js    one user's Xvfb + PulseAudio devices + Chromium, streaming, input
+server/session.js    one user's Xvfb + PulseAudio devices + Chromium, page placement, input
+server/video.js      ffmpeg x11grab → H.264 encoder, split into frames for WebCodecs
 server/inject.js     script injected into pages: virtual camera, mic signalling, clipboard
 server/cdp.js        tiny Chrome DevTools Protocol client over --remote-debugging-pipe
 server/pulse.js      PulseAudio daemon + per-user sink/source
-public/              the client page (canvas, toolbar, input, audio, camera)
+public/              the client page (full-screen video, input, audio, camera; no UI)
 nginx/               Nginx / FastPanel config
 ```

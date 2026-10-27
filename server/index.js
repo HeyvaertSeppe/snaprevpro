@@ -270,13 +270,13 @@ async function main() {
       ws.isAlive = true;
       ws.on('pong', () => { ws.isAlive = true; });
       const q = url.searchParams;
-      const session = getSession(uid, { w: q.get('w'), h: q.get('h'), dsf: q.get('dsf'), lang: q.get('lang'), tz: q.get('tz') });
+      const session = getSession(uid, { w: q.get('w'), h: q.get('h'), dsf: q.get('dsf'), lang: q.get('lang'), tz: q.get('tz'), touch: q.get('touch') });
       if (!session) {
         ws.send(JSON.stringify({ t: 'status', state: 'busy', message: 'The server is full right now. Please try again in a few minutes.' }));
         ws.close(4001, 'busy');
         return;
       }
-      session.attach(ws);
+      session.attach(ws, q.get('mode'));
     });
   });
 

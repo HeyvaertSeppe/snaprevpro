@@ -1,0 +1,15 @@
+{
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "PasswordManagerEnabled": false,
+  "TranslateEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "MetricsReportingEnabled": false,
+  "PromotionalTabsEnabled": false,
+  "ShowFullUrlsInAddressBar": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "PrivacySandboxPromptEnabled": false,
+  "BackgroundModeEnabled": false
+}

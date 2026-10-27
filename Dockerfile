@@ -8,6 +8,7 @@ RUN apt-get update \
       chromium \
       xvfb \
       pulseaudio pulseaudio-utils \
+      ffmpeg \
       fonts-liberation fonts-dejavu-core fonts-noto-color-emoji fonts-noto-core \
       ca-certificates tini tzdata \
  && rm -rf /var/lib/apt/lists/* \
@@ -27,6 +28,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY server ./server
 COPY public ./public
 COPY docker/entrypoint.sh /entrypoint.sh
+# Chromium policy: no info bars (they would shift the page) and no prompts
+COPY docker/chromium-policy.json /etc/chromium/policies/managed/gateway.json
 RUN chmod +x /entrypoint.sh
 
 ENV NODE_ENV=production \

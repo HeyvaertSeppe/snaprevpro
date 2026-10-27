@@ -47,6 +47,30 @@ function injected() {
     }
   } catch (e) { /* ignore */ }
 
+  // ---- cursor shape + text-field focus, so the visitor's device can show the
+  // right mouse cursor locally and open the on-screen keyboard ----
+  const isEditable = (el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA' ||
+    (el.tagName === 'INPUT' && !/^(button|checkbox|radio|submit|reset|file|image|range|color|hidden)$/i.test(el.type || '')));
+  let lastCursor = '';
+  window.addEventListener('mousemove', (e) => {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    let c = 'default';
+    try { c = getComputedStyle(el).cursor || 'auto'; } catch (err) { /* ignore */ }
+    if (c.includes('url(')) c = c.split(',').pop().trim();
+    if (c === 'auto') c = isEditable(el) ? 'text' : (el.closest && el.closest('a[href]') ? 'pointer' : 'default');
+    if (c !== lastCursor) { lastCursor = c; signal({ t: 'cursor', c }); }
+  }, { capture: true, passive: true });
+  let lastFocus = null;
+  const focusChanged = () => setTimeout(() => {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    const ed = isEditable(a);
+    if (ed !== lastFocus) { lastFocus = ed; signal({ t: 'focus', editable: ed }); }
+  }, 0);
+  window.addEventListener('focusin', focusChanged, true);
+  window.addEventListener('focusout', focusChanged, true);
+
   // ---- context menu: a native menu would be invisible, so block it when the site didn't ----
   window.addEventListener('contextmenu', (e) => e.preventDefault());
 

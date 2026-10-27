@@ -1,9 +1,12 @@
 'use strict';
 // One Session = one user's isolated browser:
 //   Xvfb display  +  PulseAudio sink/source  +  Chromium (own persistent profile)
-// The active tab is streamed to every connected client with CDP screencast
-// (JPEG frames); input from clients is replayed with CDP Input.* commands.
-const { spawn } = require('child_process');
+// Chromium runs in kiosk mode on a large virtual screen; the page is rendered
+// in the top-left corner at the visitor's exact size and pixel density.
+// That region is captured and streamed as H.264 video (video.js), decoded on
+// the visitor's device with WebCodecs. Browsers without WebCodecs get the
+// older JPEG stream (CDP screencast). Input is replayed with CDP Input.*.
+const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
@@ -12,8 +15,11 @@ const INJECT = require('./inject');
 const pulse = require('./pulse');
 const config = require('./config');
 const log = require('./log');
+const { X11H264 } = require('./video');
 
-const MSG = { FRAME: 1, AUDIO: 2, CAM: 0x10, MIC: 0x11 };
+const MSG = { FRAME: 1, AUDIO: 2, VIDEO: 3, CAM: 0x10, MIC: 0x11 };
+// Room (CSS px) above the page for Chromium's own tab/tool bar, which is never shown.
+const UI_ROOM = 160;
 
 const usedDisplays = new Set();
 function allocDisplay() {
@@ -49,9 +55,9 @@ function chromeFlags(s) {
     '--use-mock-keychain',
     '--hide-crash-restore-bubble',
     '--noerrdialogs',
-    `--window-position=0,0`,
-    `--window-size=${config.screen.w},${config.screen.h}`,
-    '--force-device-scale-factor=1',
+    '--window-position=0,0',
+    `--window-size=${s.viewport.w},${s.viewport.h + UI_ROOM}`,
+    `--force-device-scale-factor=${s.dsf}`,
     `--lang=${s.lang}`,
     `--accept-lang=${s.acceptLang}`,
     '--autoplay-policy=no-user-gesture-required',
@@ -83,6 +89,8 @@ function chromeFlags(s) {
       'CalculateNativeWinOcclusion,GlobalMediaControls,SpareRendererForSitePerProcess,' +
       'AudioServiceOutOfProcess',
     '--enable-features=NetworkServiceInProcess2',
+    // phones/tablets: no desktop scrollbars (like a native mobile browser)
+    ...(s.touch ? ['--hide-scrollbars'] : []),
     ...config.extraChromeFlags,
   ];
 }
@@ -133,8 +141,22 @@ class Session extends EventEmitter {
     this.lastFrame = null;
     this.lastUsed = Date.now();
     this.idleTimer = null;
-    this.viewport = { w: 1280, h: 800, dsf: 1 };
+    // Pixel density is fixed per browser launch (first visitor's screen).
+    this.dsf = Math.round(Math.min(3, Math.max(1, Number(hints.dsf) || 1)) * 100) / 100;
+    // Virtual screen just big enough for this device in either orientation
+    // (Xvfb memory grows with its size).
+    const side = Math.max(Number(hints.w) || 1280, Number(hints.h) || 800, 800) * this.dsf;
+    const r8 = (v) => Math.ceil(v / 8) * 8;
+    this.screen = {
+      w: Math.min(config.screen.w, r8(side + 32)),
+      h: Math.min(config.screen.h, r8(side + (UI_ROOM + 40) * this.dsf)),
+    };
+    this.viewport = { w: 1280, h: 800 };
     if (hints.w && hints.h) this.setViewportValues(hints);
+    this.region = null; // {x, y, w, h} of the page on the X screen, in pixels
+    this.fps = config.fps; // lowered automatically if a viewer's device can't keep up
+    this.encoder = null;
+    this.touch = hints.touch === '1';
     this.tz = /^[A-Za-z_+\-/0-9]{1,64}$/.test(hints.tz || '') ? hints.tz : '';
     const lang = /^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})?$/.test(hints.lang || '') ? hints.lang : 'en-US';
     this.lang = lang;
@@ -158,7 +180,7 @@ class Session extends EventEmitter {
       this.state = 'ready';
       this.broadcastJSON({ t: 'status', state: 'ready' });
       this.broadcastJSON({ t: 'viewport', w: this.viewport.w, h: this.viewport.h });
-      this._sendTabs();
+      this._updateVideo(true);
       log.info(`[${this.short}] browser ready (display :${this.display})`);
     } catch (e) {
       log.error(`[${this.short}] failed to start:`, e.message);
@@ -186,7 +208,7 @@ class Session extends EventEmitter {
       try { fs.unlinkSync(f); } catch { /* not there */ }
     }
     this.xvfb = spawn('Xvfb', [
-      `:${this.display}`, '-screen', '0', `${config.screen.w}x${config.screen.h}x24`,
+      `:${this.display}`, '-screen', '0', `${this.screen.w}x${this.screen.h}x24`,
       '-nolisten', 'tcp', '-dpi', '96', '-noreset',
     ], { stdio: ['ignore', 'ignore', 'ignore'] });
     this.xvfb.on('error', (e) => log.error('Xvfb:', e.message));
@@ -250,7 +272,7 @@ class Session extends EventEmitter {
 
     // 4. audio out stream + message polling
     if (this.audio) this._startAudioCapture();
-    this.pollTimer = setInterval(() => this._poll(), 250);
+    this.pollTimer = setInterval(() => this._poll(), 100);
   }
 
   _startAudioCapture() {
@@ -291,6 +313,7 @@ class Session extends EventEmitter {
       clearTimeout(this.idleTimer);
       clearInterval(this.micTimer);
       clearInterval(this.pollTimer);
+      this._stopEncoder();
       this.emit('closed');
       if (this.parec) this.parec.kill('SIGKILL');
       if (this.micFd !== null) { try { fs.closeSync(this.micFd); } catch { /* ignore */ } this.micFd = null; }
@@ -319,17 +342,22 @@ class Session extends EventEmitter {
 
   // ---------------------------------------------------------------- clients
 
-  attach(ws) {
-    const client = { ws, audio: true };
+  attach(ws, mode) {
+    const client = { ws, audio: true, mode: mode === 'jpeg' ? 'jpeg' : 'video', needKey: true };
+    this.fps = config.fps; // a new device may be faster: start at full frame rate again
     this.clients.add(client);
     this.lastUsed = Date.now();
     clearTimeout(this.idleTimer);
     this.sendJSON(client, { t: 'status', state: this.state });
     if (this.state === 'ready') {
       this.sendJSON(client, { t: 'viewport', w: this.viewport.w, h: this.viewport.h });
-      this._sendTabs();
-      if (this.lastFrame) ws.send(this.lastFrame);
-      this._restartScreencast();
+      this.sendJSON(client, { t: 'popup', open: !!this.active && this.active !== this.mainTarget });
+      if (client.mode === 'jpeg') {
+        if (this.lastFrame) ws.send(this.lastFrame);
+        this._restartScreencast();
+      } else {
+        this._updateVideo(true); // restart the encoder so the newcomer gets a key frame now
+      }
       if (this.micOn) this.sendJSON(client, { t: 'mic', on: true });
       if (this.camSid) this.sendJSON(client, { t: 'cam', on: true });
       if (this.dialog) this.sendJSON(client, this.dialog.msg);
@@ -347,6 +375,8 @@ class Session extends EventEmitter {
     ws.on('close', () => {
       this.clients.delete(client);
       this.lastUsed = Date.now();
+      this._updateVideo(false);
+      if (![...this.clients].some((c) => c.mode === 'jpeg')) this._stopScreencast();
       if (this.clients.size === 0 && !this.closing) {
         this.idleTimer = setTimeout(() => this.close('idle'), config.idleMinutes * 60 * 1000);
       }
@@ -387,7 +417,7 @@ class Session extends EventEmitter {
       if (!page) return;
       page.title = targetInfo.title;
       page.url = targetInfo.url;
-      this._sendTabs();
+      this._checkExternal(targetInfo.targetId);
     });
 
     const gone = (targetId) => {
@@ -402,7 +432,8 @@ class Session extends EventEmitter {
         if (next) this._activate(next[0]);
         else if (!this.closing) this.cdp.send('Target.createTarget', { url: config.startUrl }).catch(() => {});
       }
-      this._sendTabs();
+      if (targetId === this.mainTarget) this.mainTarget = null;
+      this._sendPopup();
     };
     cdp.on('Target.targetDestroyed', ({ targetId }) => gone(targetId));
     cdp.on('Target.detachedFromTarget', ({ sessionId, targetId }) => {
@@ -412,6 +443,13 @@ class Session extends EventEmitter {
     });
 
     cdp.on('Page.screencastFrame', (p, sid) => this._onFrame(p, sid));
+
+    // window.open / target=_blank to another website: open it on the visitor's device.
+    cdp.on('Page.windowOpen', (p) => {
+      if (!this._isExternal(p.url)) return;
+      this.lastOpened = { url: p.url, t: Date.now() };
+      this.broadcastJSON({ t: 'open', url: p.url });
+    });
 
     cdp.on('Page.javascriptDialogOpening', (p, sid) => {
       if (p.type === 'beforeunload' || !this.clients.size) {
@@ -477,6 +515,8 @@ class Session extends EventEmitter {
           if (m.t === 'clip' && typeof m.text === 'string') this.broadcastJSON({ t: 'clip', text: m.text.slice(0, 1e6) });
           else if (m.t === 'cam') this._setCam(m.on ? sid : null);
           else if (m.t === 'mic') this._setMic(!!m.on);
+          else if (m.t === 'cursor' && typeof m.c === 'string') this.broadcastJSON({ t: 'cursor', c: m.c.slice(0, 40) });
+          else if (m.t === 'focus') this.broadcastJSON({ t: 'focus', editable: !!m.editable });
         }
       }
     } finally {
@@ -486,8 +526,17 @@ class Session extends EventEmitter {
 
   async _setupPage(sid, info, waiting) {
     const targetId = info.targetId;
+    // the popup for a link we just opened on the visitor's device: close it right away
+    if (info.openerId && this.lastOpened && Date.now() - this.lastOpened.t < 3000 &&
+        (!info.url || info.url === 'about:blank' || info.url === this.lastOpened.url)) {
+      // let it start first: the opener page waits until its popup is running
+      if (waiting) await this.cdp.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
+      this.cdp.send('Target.closeTarget', { targetId }).catch(() => {});
+      return;
+    }
     log.debug(`[${this.short}] tab attached ${targetId.slice(0, 8)} ${info.url} opener=${info.openerId || '-'} waiting=${waiting}`);
     this.pages.set(targetId, { sid, title: info.title, url: info.url, order: ++this.order, since: Date.now() });
+    if (!this.mainTarget) this.mainTarget = targetId;
     this.sessToTarget.set(sid, targetId);
     const s = (m, p) => this.cdp.send(m, p, sid).catch((e) => log.debug(`[${this.short}] ${m}:`, e.message));
     await Promise.all([
@@ -506,15 +555,164 @@ class Session extends EventEmitter {
       s('Page.navigate', { url: config.startUrl });
     }
     this._activate(targetId);
+    this._checkExternal(targetId);
+  }
+
+  // A new tab/popup that goes to another website is opened on the visitor's
+  // own device instead (there is no tab bar or address bar here).
+  _isExternal(url) {
+    if (!/^https?:/i.test(url || '')) return false;
+    let host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch { return false; }
+    const startHost = new URL(config.startUrl).hostname.toLowerCase();
+    return !(host === startHost || config.allowedDomains.some((d) => host === d || host.endsWith(`.${d}`)));
+  }
+
+  _checkExternal(targetId) {
+    if (targetId === this.mainTarget) return;
+    const page = this.pages.get(targetId);
+    if (!page || !this._isExternal(page.url)) return;
+    if (!this.lastOpened || this.lastOpened.url !== page.url || Date.now() - this.lastOpened.t > 3000) {
+      this.broadcastJSON({ t: 'open', url: page.url });
+    }
+    this.cdp.send('Target.closeTarget', { targetId }).catch(() => {});
   }
 
   // ---------------------------------------------------------------- screen
 
   _applyMetrics(sid) {
-    const { w, h, dsf } = this.viewport;
+    const { w, h } = this.viewport;
+    // deviceScaleFactor 0 = keep the real one (set with --force-device-scale-factor)
     return this.cdp.send('Emulation.setDeviceMetricsOverride', {
-      width: w, height: h, deviceScaleFactor: dsf, mobile: false, screenWidth: w, screenHeight: h,
+      width: w, height: h, deviceScaleFactor: 0, mobile: false, screenWidth: w, screenHeight: h,
     }, sid).catch(() => {});
+  }
+
+  // Keep the tab's window in the top-left corner, just big enough for the page
+  // (a smaller window = less memory and work for Chromium).
+  async _fitWindow(targetId) {
+    try {
+      const { windowId } = await this.cdp.send('Browser.getWindowForTarget', { targetId });
+      await this.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {});
+      await this.cdp.send('Browser.setWindowBounds', {
+        windowId, bounds: { left: 0, top: 0, width: this.viewport.w, height: this.viewport.h + UI_ROOM },
+      });
+    } catch (e) {
+      log.debug('fitWindow:', e.message);
+    }
+  }
+
+  // Find where the page's top-left corner is on the X screen (the kiosk
+  // window position and any info bar can shift it by a few pixels):
+  // draw a magenta marker with the DevTools overlay and look for it.
+  async _calibrate() {
+    const page = this.active && this.pages.get(this.active);
+    if (!page) return;
+    const sid = page.sid;
+    const s = (m, p) => this.cdp.send(m, p, sid, 5000);
+    let found = null;
+    try {
+      await s('DOM.enable');
+      await s('Overlay.enable');
+      const W = 640;
+      const H = 640;
+      for (let attempt = 0; attempt < 15 && !found && !this.closing; attempt++) {
+        await s('Overlay.highlightRect', { x: 0, y: 0, width: 4, height: 4, color: { r: 255, g: 0, b: 255, a: 1 } });
+        await wait(attempt ? 200 : 100);
+        const raw = await new Promise((resolve) => {
+          execFile('ffmpeg', ['-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0', '-video_size', `${W}x${H}`,
+            '-i', `:${this.display}.0+0,0`, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+          { encoding: 'buffer', maxBuffer: 8 * 1024 * 1024, timeout: 5000 }, (err, out) => {
+            if (err) log.debug('calibrate capture:', err.message.slice(0, 200));
+            resolve(err ? null : out);
+          });
+        });
+        if (!raw) continue;
+        for (let y = 0; y < H && !found; y++) {
+          for (let x = 0; x < W; x++) {
+            const i = (y * W + x) * 3;
+            if (raw[i] > 230 && raw[i + 1] < 40 && raw[i + 2] > 230) { found = { x, y }; break; }
+          }
+        }
+      }
+    } catch (e) {
+      log.debug('calibrate:', e.message);
+    } finally {
+      await s('Overlay.hideHighlight').catch(() => {});
+      await s('Overlay.disable').catch(() => {});
+      await s('DOM.disable').catch(() => {});
+    }
+    const even = (v) => Math.max(2, Math.floor(v / 2) * 2);
+    const pos = found || (this.region ? { x: this.region.x, y: this.region.y } : { x: 0, y: 0 });
+    if (!found && !this.closing) {
+      log.warn(`[${this.short}] could not locate page on screen yet; retrying soon`);
+      setTimeout(() => { this.needCalibration = true; this._updateVideo(true); }, 3000);
+    }
+    this.region = {
+      x: pos.x, y: pos.y,
+      w: even(Math.min(this.viewport.w * this.dsf, this.screen.w - pos.x)),
+      h: even(Math.min(this.viewport.h * this.dsf, this.screen.h - pos.y)),
+    };
+    log.debug(`[${this.short}] page region`, JSON.stringify(this.region));
+  }
+
+  // (Re)start or stop the H.264 encoder depending on who is watching.
+  _updateVideo(restart) {
+    const wanted = this.state === 'ready' && [...this.clients].some((c) => c.mode === 'video');
+    if (!wanted) { this._stopEncoder(); return; }
+    if (this.encoder && !restart) return;
+    clearTimeout(this.videoTimer);
+    this.videoTimer = setTimeout(async () => {
+      if (this.calibrating) { this._updateVideo(true); return; }
+      this.calibrating = true;
+      try {
+        if (!this.region || this.needCalibration) {
+          this.needCalibration = false;
+          await this._calibrate();
+        }
+      } finally {
+        this.calibrating = false;
+      }
+      if (this.closing || !this.region) return;
+      this._stopEncoder();
+      log.debug(`[${this.short}] encoder start`, JSON.stringify(this.region));
+      const enc = new X11H264({ display: this.display, ...this.region, fps: this.fps });
+      this.encoder = enc;
+      for (const c of this.clients) c.needKey = true;
+      this.broadcastJSON({ t: 'video', w: this.region.w, h: this.region.h });
+      enc.on('frame', (au, key) => this._onVideoFrame(au, key));
+      enc.on('exit', () => { if (this.encoder === enc) { this.encoder = null; setTimeout(() => this._updateVideo(true), 1000); } });
+      enc.start();
+    }, 60);
+  }
+
+  _stopEncoder() {
+    clearTimeout(this.videoTimer);
+    if (this.encoder) { this.encoder.stop(); this.encoder = null; }
+  }
+
+  _onVideoFrame(au, key) {
+    const buf = Buffer.allocUnsafe(au.length + 2);
+    buf[0] = MSG.VIDEO;
+    buf[1] = key ? 1 : 0;
+    au.copy(buf, 2);
+    let behind = false;
+    for (const c of this.clients) {
+      if (c.mode !== 'video' || c.ws.readyState !== 1) continue;
+      if (c.needKey && !key) continue;
+      if (c.ws.bufferedAmount > 3 * 1024 * 1024) { c.needKey = true; behind = true; continue; }
+      c.needKey = false;
+      c.ws.send(buf);
+    }
+    // A slow connection skipped frames: it needs a fresh key frame to recover.
+    if (behind) { log.debug(`[${this.short}] client behind, key frame`); this._requestKeyFrame(); }
+  }
+
+  _requestKeyFrame() {
+    const now = Date.now();
+    if (now - (this.lastKeyRequest || 0) < 2000) return;
+    this.lastKeyRequest = now;
+    this._updateVideo(true);
   }
 
   async _activate(targetId) {
@@ -525,19 +723,33 @@ class Session extends EventEmitter {
     this.active = targetId;
     page.order = ++this.order;
     await this.cdp.send('Page.bringToFront', {}, page.sid).catch(() => {});
+    await this._fitWindow(targetId);
     await this._applyMetrics(page.sid);
     await this._restartScreencast();
-    this._sendTabs();
+    this._sendPopup();
+    // a popup can be a separate window: find the page again and restart the stream
+    if (this.region) { this.needCalibration = true; this._updateVideo(true); }
   }
 
+  // Tell clients whether a popup (not the main tab) is in front, so they can offer a close button.
+  _sendPopup() {
+    this.broadcastJSON({ t: 'popup', open: !!this.active && this.active !== this.mainTarget });
+  }
+
+  // JPEG fallback stream, only while a client without WebCodecs is connected.
   async _restartScreencast() {
     const page = this.active && this.pages.get(this.active);
-    if (!page) return;
-    const { w, h, dsf } = this.viewport;
+    if (!page || ![...this.clients].some((c) => c.mode === 'jpeg')) return;
+    const { w, h } = this.viewport;
     await this.cdp.send('Page.stopScreencast', {}, page.sid).catch(() => {});
     await this.cdp.send('Page.startScreencast', {
-      format: 'jpeg', quality: config.jpegQuality, maxWidth: Math.round(w * dsf), maxHeight: Math.round(h * dsf), everyNthFrame: 1,
+      format: 'jpeg', quality: config.jpegQuality, maxWidth: Math.round(w * this.dsf), maxHeight: Math.round(h * this.dsf), everyNthFrame: 1,
     }, page.sid).catch((e) => log.debug('screencast:', e.message));
+  }
+
+  _stopScreencast() {
+    const page = this.active && this.pages.get(this.active);
+    if (page) this.cdp.send('Page.stopScreencast', {}, page.sid).catch(() => {});
   }
 
   _onFrame(p, sid) {
@@ -550,31 +762,25 @@ class Session extends EventEmitter {
     jpeg.copy(buf, 1);
     this.lastFrame = buf;
     for (const c of this.clients) {
-      if (c.ws.readyState === 1 && c.ws.bufferedAmount < 2 * 1024 * 1024) c.ws.send(buf);
+      if (c.mode === 'jpeg' && c.ws.readyState === 1 && c.ws.bufferedAmount < 2 * 1024 * 1024) c.ws.send(buf);
     }
     // Back-pressure: only ask for the next frame when clients have caught up.
     const start = Date.now();
     const tryAck = () => {
-      const behind = [...this.clients].some((c) => c.ws.readyState === 1 && c.ws.bufferedAmount > 256 * 1024);
+      const behind = [...this.clients].some((c) => c.mode === 'jpeg' && c.ws.readyState === 1 && c.ws.bufferedAmount > 256 * 1024);
       if (!behind || Date.now() - start > 1500) ack();
       else setTimeout(tryAck, 25);
     };
     tryAck();
   }
 
-  setViewportValues({ w, h, dsf }) {
+  // Viewport in CSS pixels; must fit on the X screen at this browser's pixel density
+  // (with some room for the window offset / an info bar).
+  setViewportValues({ w, h }) {
     this.viewport = {
-      w: clamp(w, 320, config.maxViewport.w),
-      h: clamp(h, 240, config.maxViewport.h),
-      dsf: Math.min(2, Math.max(1, Number(dsf) || 1)),
+      w: clamp(w, 200, Math.floor((this.screen.w - 16) / this.dsf)),
+      h: clamp(h, 200, Math.floor(this.screen.h / this.dsf) - UI_ROOM),
     };
-  }
-
-  _sendTabs() {
-    const list = [...this.pages.entries()]
-      .sort((a, b) => a[1].order - b[1].order)
-      .map(([id, p]) => ({ id, title: p.title || p.url || 'New tab', url: p.url || '', active: id === this.active }));
-    this.broadcastJSON({ t: 'tabs', list });
   }
 
   // ---------------------------------------------------------------- camera / mic
@@ -683,10 +889,12 @@ class Session extends EventEmitter {
         clearTimeout(this.resizeTimer);
         this.resizeTimer = setTimeout(async () => {
           const p = this.active && this.pages.get(this.active);
-          if (p) await this._applyMetrics(p.sid);
+          if (p) { await this._fitWindow(this.active); await this._applyMetrics(p.sid); }
           await this._restartScreencast();
           this.broadcastJSON({ t: 'viewport', w: this.viewport.w, h: this.viewport.h });
-        }, 120);
+          this.needCalibration = true;
+          this._updateVideo(true);
+        }, 150);
         break;
       case 'nav':
         if (!sid) return;
@@ -697,6 +905,19 @@ class Session extends EventEmitter {
           const entry = h.entries[h.currentIndex + (m.action === 'back' ? -1 : 1)];
           if (entry) await send('Page.navigateToHistoryEntry', { entryId: entry.id });
         }
+        break;
+      case 'back':
+        // device back button: close a popup, otherwise go back in the page's history
+        if (this.active && this.active !== this.mainTarget) {
+          await this.cdp.send('Target.closeTarget', { targetId: this.active });
+        } else if (sid) {
+          const h = await send('Page.getNavigationHistory', {});
+          const entry = h.entries[h.currentIndex - 1];
+          if (entry) await send('Page.navigateToHistoryEntry', { entryId: entry.id });
+        }
+        break;
+      case 'closepopup':
+        if (this.active && this.active !== this.mainTarget) await this.cdp.send('Target.closeTarget', { targetId: this.active });
         break;
       case 'tab':
         if (!this.pages.has(m.id)) return;
@@ -733,6 +954,25 @@ class Session extends EventEmitter {
       }
       case 'audio':
         client.audio = !!m.on;
+        break;
+      case 'slow':
+        // a viewer's decoder can't keep up: lower the frame rate instead of lagging
+        if (this.fps > 15 && Date.now() - (this.lastSlow || 0) > 4000) {
+          this.lastSlow = Date.now();
+          this.fps = Math.max(15, Math.round(this.fps * 0.67));
+          log.info(`[${this.short}] viewer is slow, video now ${this.fps} fps`);
+          this._updateVideo(true);
+        }
+        break;
+      case 'keyframe':
+        log.debug(`[${this.short}] client asked for a key frame`);
+        this._requestKeyFrame();
+        break;
+      case 'mode':
+        client.mode = m.mode === 'jpeg' ? 'jpeg' : 'video';
+        client.needKey = true;
+        if (client.mode === 'jpeg') { if (this.lastFrame) client.ws.send(this.lastFrame); await this._restartScreencast(); }
+        this._updateVideo(client.mode === 'video');
         break;
       case 'restart':
         this.broadcastJSON({ t: 'status', state: 'restarting', message: 'Restarting your browser…' });

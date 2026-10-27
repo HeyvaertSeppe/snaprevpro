@@ -30,10 +30,21 @@ module.exports = {
   accessCode: env.ACCESS_CODE || '',
   chromeBin: findChrome(),
   extraChromeFlags: (env.EXTRA_CHROME_FLAGS || '').split(/\s+/).filter(Boolean),
-  jpegQuality: Math.min(95, num('JPEG_QUALITY', 70)),
+  // Video stream (H.264). Higher FPS / lower CRF = smoother / sharper but more CPU + bandwidth.
+  fps: Math.min(60, num('FPS', 60)),
+  crf: Math.min(40, num('VIDEO_CRF', 20)),
+  maxBitrateMbit: num('VIDEO_MAX_MBIT', 12),
+  x264Preset: env.X264_PRESET || 'superfast',
+  encoderThreads: num('ENCODER_THREADS', 4),
+  // JPEG fallback for old browsers without WebCodecs
+  jpegQuality: Math.min(95, num('JPEG_QUALITY', 80)),
+  // Links to other sites opened in a new tab are opened on the visitor's own device instead.
+  allowedDomains: (env.ALLOWED_DOMAINS || 'snapchat.com,snap.com,snapkit.com,sc-cdn.net,sc-static.net,snapads.com')
+    .split(',').map((d) => d.trim().toLowerCase()).filter(Boolean),
   maxUploadBytes: num('MAX_UPLOAD_MB', 250) * 1024 * 1024,
-  // Size of the virtual X screen; the page viewport can be anything up to this.
-  screen: { w: 1920, h: 1080 },
-  maxViewport: { w: 2560, h: 2560 },
+  // Size of the virtual X screen (memory is only used for the part that is drawn).
+  // Upper limit; each user's screen is sized to their device. The page is
+  // rendered in its top-left corner at the visitor's exact size.
+  screen: { w: 3840, h: 3072 },
   logLevel: env.LOG_LEVEL || 'info',
 };
