@@ -80,9 +80,23 @@ Keep the site config FastPanel generated (`location /` with
 WebSocket support in the site's **includes file**, which FastPanel never
 overwrites:
 
+**Easiest:** run this on the FastPanel server as root. It writes the
+includes file, tests Nginx, and only reloads if the test passes (otherwise it
+restores the previous files):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HeyvaertSeppe/snaprevpro/claude/friendly-fermi-ri5uzx/nginx/install-fastpanel.sh -o install-fastpanel.sh
+BACKEND=10.1.3.241:3080 bash install-fastpanel.sh
+```
+
+**By hand:**
+
 1. Copy [`nginx/fastpanel-includes.conf`](nginx/fastpanel-includes.conf) into
    `/etc/nginx/fastpanel2-sites/fastuser/web.heyvaertseppe.be.includes`
-   (change `10.1.3.241:3080` if your container has another address).
+   (change `10.1.3.241:3080` if your container has another address). Paste
+   **only** that file: it goes inside the site's `server { }` block. A full
+   `nginx.conf` (with `user`/`events`/`http`) there gives
+   `[emerg] "events" directive is not allowed here`.
 2. `nginx -t && systemctl reload nginx`
 
 It adds `location /ws` (HTTP/1.1 + `Upgrade` headers, no timeout),
