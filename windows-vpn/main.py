@@ -1,4 +1,4 @@
-"""Entry point for BSD46 VPN."""
+"""Entry point for SnapVPN."""
 
 import ctypes
 import os
@@ -6,9 +6,9 @@ import sys
 from tkinter import messagebox
 import tkinter as tk
 
-from bsd46vpn import instance
-from bsd46vpn.autostart import AUTOSTART_ARG
-from bsd46vpn.config import APP_NAME
+from snapvpn import instance
+from snapvpn.autostart import AUTOSTART_ARG
+from snapvpn.config import APP_NAME
 
 
 def _is_admin() -> bool:
@@ -45,7 +45,7 @@ def main() -> int:
     if not instance.acquire():
         return 0  # the running copy has been asked to show its window
 
-    from bsd46vpn.app import App
+    from snapvpn.app import App
 
     app = App(start_hidden=AUTOSTART_ARG in sys.argv)
     app.mainloop()

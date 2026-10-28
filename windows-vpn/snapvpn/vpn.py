@@ -16,6 +16,7 @@ import time
 from ctypes import wintypes
 from typing import Callable
 
+from . import netfix
 from .config import ADAPTER_NAME, SERVER, USERNAME, openconnect_dir
 
 
@@ -269,6 +270,10 @@ class VpnController:
             self._log(f"openconnect.exe not found at {exe}")
             return "error"
         self._log(f"Connecting to {SERVER} as {USERNAME}…")
+        # Have the routing script log what it does, so it shows up in our log.
+        env = dict(os.environ, LOG2FILE="1")
+        script_log_offset = netfix.script_log_size()
+        session_over = threading.Event()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -276,6 +281,7 @@ class VpnController:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=os.path.dirname(exe),
+                env=env,
                 creationflags=_CREATE_NO_WINDOW,
             )
         except OSError as e:
@@ -309,6 +315,15 @@ class VpnController:
             if m:
                 self.ip = m.group(1)
                 self._set_state(State.CONNECTED, self.ip)
+                # The routing script has finished by the time this is printed.
+                for script_line in netfix.read_script_log(script_log_offset):
+                    self._log(script_line)
+                script_log_offset = netfix.script_log_size()
+                threading.Thread(
+                    target=netfix.after_connect,
+                    args=(ADAPTER_NAME, self._log, session_over.wait),
+                    name="netfix", daemon=True,
+                ).start()
                 continue
             if _RE_CONNECTED.search(line) and self.state == State.RECONNECTING and self.ip:
                 self._set_state(State.CONNECTED, self.ip)
@@ -322,6 +337,7 @@ class VpnController:
                 self._set_state(State.RECONNECTING, "Connection interrupted")
 
         code = proc.wait()
+        session_over.set()
         with self._lock:
             self._proc = None
         self._log(f"openconnect exited (code {code}).")

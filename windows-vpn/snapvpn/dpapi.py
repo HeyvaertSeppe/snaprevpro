@@ -10,6 +10,7 @@ from ctypes import wintypes
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 # Extra entropy ties the blob to this app: other DPAPI users on the same
 # account can't trivially decrypt it without knowing this value.
+# Kept from the app's old name so existing saved passwords still decrypt.
 _ENTROPY = b"BSD46-VPN/password/v1"
 
 

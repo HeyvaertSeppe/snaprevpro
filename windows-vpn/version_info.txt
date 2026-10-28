@@ -12,11 +12,11 @@ VSVersionInfo(
   kids=[
     StringFileInfo([
       StringTable('040904B0', [
-        StringStruct('FileDescription', 'BSD46 VPN'),
+        StringStruct('FileDescription', 'SnapVPN'),
         StringStruct('FileVersion', '1.0.0'),
-        StringStruct('InternalName', 'BSD46-VPN'),
-        StringStruct('OriginalFilename', 'BSD46-VPN.exe'),
-        StringStruct('ProductName', 'BSD46 VPN'),
+        StringStruct('InternalName', 'SnapVPN'),
+        StringStruct('OriginalFilename', 'SnapVPN.exe'),
+        StringStruct('ProductName', 'SnapVPN'),
         StringStruct('ProductVersion', '1.0.0'),
         StringStruct('LegalCopyright', 'Bundles OpenConnect (LGPL-2.1) and Wintun (prebuilt, signed)'),
       ])

@@ -17,6 +17,7 @@ from xml.sax.saxutils import escape
 from .config import APP_NAME, exe_path
 
 TASK_NAME = APP_NAME
+OLD_TASK_NAME = "BSD46 VPN"  # the app's name before it became SnapVPN
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_ARG = "--autostart"
 _NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
@@ -122,6 +123,14 @@ def disable() -> None:
 
 def refresh_if_enabled() -> None:
     """Re-register the task so it follows the .exe if it was moved."""
+    if _schtasks("/Query", "/TN", OLD_TASK_NAME).returncode == 0:
+        # Replace the task from before the rename with one under the new name.
+        _schtasks("/Delete", "/TN", OLD_TASK_NAME, "/F")
+        try:
+            enable()
+        except Exception:
+            pass
+        return
     if is_enabled():
         try:
             enable()

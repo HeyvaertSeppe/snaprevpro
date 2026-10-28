@@ -2,7 +2,7 @@
 # PyInstaller spec: one portable, self-elevating .exe with OpenConnect,
 # its DLLs, Wintun and the routing script bundled inside.
 #
-# Build (from windows-vpn/):  pyinstaller --noconfirm BSD46VPN.spec
+# Build (from windows-vpn/):  pyinstaller --noconfirm SnapVPN.spec
 
 import os
 from PyInstaller.utils.hooks import collect_data_files
@@ -32,7 +32,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="BSD46-VPN",
+    name="SnapVPN",
     icon="assets/app.ico",
     version="version_info.txt",
     console=False,

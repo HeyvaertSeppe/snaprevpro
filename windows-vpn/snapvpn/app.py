@@ -10,7 +10,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from . import autostart, instance
-from .config import APP_NAME, DATA_DIR, LOG_FILE, SERVER, USERNAME, Settings, resource_path
+from .config import APP_NAME, DATA_DIR, LOG_FILE, Settings, resource_path
 from .icons import make_icon
 from .tray import Tray
 from .vpn import State, VpnController
@@ -36,13 +36,6 @@ _STATE_STYLE = {
     State.DISCONNECTING: ("busy", AMBER),
     State.CONNECTED: ("connected", GREEN),
 }
-
-
-def _fmt_duration(seconds: float) -> str:
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 class App(ctk.CTk):
@@ -74,7 +67,6 @@ class App(ctk.CTk):
         instance.listen(lambda: self._events.put(("action", "show")))
         self.tray.start()
         self.after(50, self._pump)
-        self.after(1000, self._tick)
 
         # Auto-connect as soon as we have a password.
         if self._password:
@@ -84,8 +76,6 @@ class App(ctk.CTk):
         else:
             self.after(150, lambda: self.pw_entry.focus_set())
 
-        # Keep the auto-start task pointing at this .exe if it was moved.
-        self.after(2000, autostart.refresh_if_enabled)
 
     # ------------------------------------------------------------------ UI
 
@@ -124,17 +114,8 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(card, text="Disconnected", font=big_font, text_color=TEXT)
         self.status_label.grid(row=1, column=0)
         self.detail_label = ctk.CTkLabel(card, text="", font=body_font, text_color=MUTED)
-        self.detail_label.grid(row=2, column=0, pady=(0, 14))
+        self.detail_label.grid(row=2, column=0, pady=(0, 22))
 
-        info = ctk.CTkFrame(card, fg_color="transparent")
-        info.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 18))
-        info.grid_columnconfigure(1, weight=1)
-        self._info_values = {}
-        for i, (key, value) in enumerate((("Server", SERVER), ("User", USERNAME), ("VPN IP", "–"), ("Uptime", "–"))):
-            ctk.CTkLabel(info, text=key, font=small_font, text_color=MUTED).grid(row=i, column=0, sticky="w", pady=1)
-            lbl = ctk.CTkLabel(info, text=value, font=small_font, text_color=TEXT)
-            lbl.grid(row=i, column=1, sticky="e", pady=1)
-            self._info_values[key] = lbl
 
         # Password card (only when we have no password)
         self.pw_card = ctk.CTkFrame(self, fg_color=CARD, corner_radius=18, border_width=1, border_color=CARD_BORDER)
@@ -143,7 +124,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.pw_card, text="Password", font=small_font, text_color=MUTED).grid(
             row=0, column=0, sticky="w", padx=18, pady=(14, 2))
         self.pw_entry = ctk.CTkEntry(self.pw_card, show="•", height=38, corner_radius=10, font=body_font,
-                                     placeholder_text=f"Password for {USERNAME}",
+                                     placeholder_text="Password",
                                      fg_color="#0f1219", border_color=CARD_BORDER)
         self.pw_entry.grid(row=1, column=0, sticky="ew", padx=18)
         self.pw_entry.bind("<Return>", lambda _e: self._on_main_button())
@@ -167,7 +148,7 @@ class App(ctk.CTk):
         self.autostart_switch = ctk.CTkSwitch(opts, text="Start with Windows", variable=self.autostart_var,
                                               font=small_font, text_color=TEXT, command=self._on_autostart)
         self.autostart_switch.grid(row=0, column=0, sticky="w")
-        self.after(10, lambda: self.autostart_var.set(autostart.is_enabled()))
+        self.after(10, self._load_autostart)
         self.forget_button = ctk.CTkButton(opts, text="Forget password", width=10, height=26, font=small_font,
                                            fg_color="transparent", hover_color=GREY_BTN, text_color=MUTED,
                                            command=self._on_forget)
@@ -213,8 +194,7 @@ class App(ctk.CTk):
         elif state == State.DISCONNECTED:
             self.detail_label.configure(text="Not connected")
         else:
-            self.detail_label.configure(text=detail or SERVER)
-        self._info_values["VPN IP"].configure(text=self.vpn.ip or "–")
+            self.detail_label.configure(text=detail or "Please wait")
         if state == State.DISCONNECTED:
             self.main_button.configure(text="Connect", fg_color=ACCENT, hover_color=ACCENT_HOVER, state="normal")
         elif state == State.CONNECTED:
@@ -223,8 +203,7 @@ class App(ctk.CTk):
             self.main_button.configure(text="Disconnecting…", fg_color=GREY_BTN, hover_color=GREY_BTN, state="disabled")
         else:
             self.main_button.configure(text="Cancel", fg_color=GREY_BTN, hover_color=GREY_BTN_HOVER, state="normal")
-        self._tick(reschedule=False)
-        self.tray.set_state(state, self.vpn.ip, error=error)
+        self.tray.set_state(state, error=error)
 
     def _toggle_log(self) -> None:
         self._log_visible = not self._log_visible
@@ -239,7 +218,7 @@ class App(ctk.CTk):
 
     def _fit_height(self) -> None:
         # Fixed heights (CTk applies DPI scaling to geometry() itself).
-        h = 560
+        h = 430
         if self.pw_card.winfo_manager():
             h += 150 if self.pw_error.cget("text") else 125
         if self._log_visible:
@@ -277,6 +256,12 @@ class App(ctk.CTk):
             autostart.enable() if want else autostart.disable()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Could not change auto-start:\n{e}")
+        self.autostart_var.set(autostart.is_enabled())
+
+    def _load_autostart(self) -> None:
+        # Keep the auto-start task pointing at this .exe (it may have moved,
+        # or still use the app's old name), then show its state.
+        autostart.refresh_if_enabled()
         self.autostart_var.set(autostart.is_enabled())
 
     def _on_forget(self) -> None:
@@ -347,15 +332,6 @@ class App(ctk.CTk):
         self.tray.notify("Login failed. Open the app to enter your password.")
         self.show()
         self.pw_entry.focus_set()
-
-    def _tick(self, reschedule: bool = True) -> None:
-        since = self.vpn.connected_since
-        if since and self.vpn.state == State.CONNECTED:
-            self._info_values["Uptime"].configure(text=_fmt_duration(time.time() - since))
-        else:
-            self._info_values["Uptime"].configure(text="–")
-        if reschedule and not self._quitting:
-            self.after(1000, self._tick)
 
     # --------------------------------------------------------------- misc
 

@@ -1,4 +1,4 @@
-# BSD46 VPN (Windows)
+# SnapVPN (Windows)
 
 A small, portable AnyConnect-compatible VPN client for Windows. It's one
 `.exe` with nothing to install. It always connects to
@@ -9,7 +9,7 @@ the password.
 
 Every push that touches `windows-vpn/` runs the **Build Windows VPN app**
 workflow. Open the run in the GitHub Actions tab and download the
-`BSD46-VPN` artifact (a zip holding `BSD46-VPN.exe`). You can also start
+`SnapVPN` artifact (a zip holding `SnapVPN.exe`). You can also start
 the workflow by hand with "Run workflow".
 
 ## Using it
@@ -28,8 +28,13 @@ the workflow by hand with "Run workflow".
   Run-key programs that need admin rights. The task starts the app in the tray
   at sign-in, with no UAC prompt, and it auto-connects.
 - Launching the .exe again just brings the running window to the front.
+- When the server sends all traffic through the VPN (full tunnel), SnapVPN
+  also routes IPv6 into the tunnel, like AnyConnect does. Otherwise IPv6
+  over Wi-Fi would bypass the VPN, and Windows would keep showing the Wi-Fi
+  icon instead of the Ethernet one. After connecting, "Show log" lists how
+  Windows sees each connection (lines starting with `windows:`).
 
-Files are kept in `%APPDATA%\BSD46 VPN\`: `settings.json` (with the encrypted
+Files are kept in `%APPDATA%\SnapVPN\`: `settings.json` (with the encrypted
 password blob) and `vpn.log`. **Forget password** clears the saved password.
 
 ## What's inside
@@ -50,7 +55,7 @@ password blob) and `vpn.log`. **Forget password** clears the saved password.
    ```
    pip install -r requirements.txt
    python scripts/make_icon.py
-   pyinstaller --noconfirm BSD46VPN.spec
+   pyinstaller --noconfirm SnapVPN.spec
    ```
 
-The result is `dist\BSD46-VPN.exe`.
+The result is `dist\SnapVPN.exe`.

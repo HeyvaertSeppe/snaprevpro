@@ -8,15 +8,17 @@ from dataclasses import asdict, dataclass
 
 from . import dpapi
 
-APP_NAME = "BSD46 VPN"
+APP_NAME = "SnapVPN"
 SERVER = "bsd46.heyvaertseppe.qzz.io"
 USERNAME = "bypass"
 # Name of the Wintun network adapter that shows up in Windows.
-ADAPTER_NAME = "BSD46 VPN"
+ADAPTER_NAME = "SnapVPN"
 
 _APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(_APPDATA, APP_NAME)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+# Where settings lived before the app was renamed to SnapVPN.
+OLD_SETTINGS_FILE = os.path.join(_APPDATA, "BSD46 VPN", "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "vpn.log")
 
 
@@ -52,8 +54,11 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
+        path = SETTINGS_FILE
+        if not os.path.exists(path) and os.path.exists(OLD_SETTINGS_FILE):
+            path = OLD_SETTINGS_FILE  # carry over the saved password after the rename
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except (OSError, ValueError):
             return cls()

@@ -5,8 +5,8 @@ import threading
 from ctypes import wintypes
 from typing import Callable
 
-_MUTEX_NAME = "Local\\BSD46VPN.SingleInstance"
-_EVENT_NAME = "Local\\BSD46VPN.ShowWindow"
+_MUTEX_NAME = "Local\\SnapVPN.SingleInstance"
+_EVENT_NAME = "Local\\SnapVPN.ShowWindow"
 _ERROR_ALREADY_EXISTS = 183
 _INFINITE = 0xFFFFFFFF
 

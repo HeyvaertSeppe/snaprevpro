@@ -37,7 +37,7 @@ class Tray:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda: post("quit")),
         )
-        self._icon = pystray.Icon("bsd46vpn", self._images["disconnected"], APP_NAME, menu)
+        self._icon = pystray.Icon("snapvpn", self._images["disconnected"], APP_NAME, menu)
         self._thread = threading.Thread(target=self._icon.run, name="tray", daemon=True)
 
     def _status_text(self) -> str:

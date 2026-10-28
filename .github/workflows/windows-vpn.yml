@@ -57,7 +57,7 @@ jobs:
         run: python scripts/make_icon.py
 
       - name: Check the app imports cleanly
-        run: python -c "import bsd46vpn.app, bsd46vpn.vpn, bsd46vpn.tray, bsd46vpn.autostart, bsd46vpn.dpapi as d; assert d.unprotect(d.protect(b'x')) == b'x'; print('ok')"
+        run: python -c "import snapvpn.app, snapvpn.vpn, snapvpn.tray, snapvpn.autostart, snapvpn.dpapi as d; assert d.unprotect(d.protect(b'x')) == b'x'; print('ok')"
 
       - name: Bundled openconnect runs outside MSYS2
         shell: pwsh
@@ -67,17 +67,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "openconnect.exe failed to start" }
 
       - name: Build portable .exe
-        run: pyinstaller --noconfirm --clean BSD46VPN.spec
+        run: pyinstaller --noconfirm --clean SnapVPN.spec
 
       - name: Show result
         shell: pwsh
         run: |
-          Get-Item dist\BSD46-VPN.exe | Format-List Name, Length, LastWriteTime
-          (Get-FileHash dist\BSD46-VPN.exe -Algorithm SHA256).Hash
+          Get-Item dist\SnapVPN.exe | Format-List Name, Length, LastWriteTime
+          (Get-FileHash dist\SnapVPN.exe -Algorithm SHA256).Hash
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BSD46-VPN
-          path: windows-vpn/dist/BSD46-VPN.exe
+          name: SnapVPN
+          path: windows-vpn/dist/SnapVPN.exe
           if-no-files-found: error
