@@ -54,14 +54,24 @@ cp "$PREFIX/sbin/openconnect.exe" "$OUT/"
 cp "$PREFIX"/bin/*.dll "$OUT/"
 
 # Copy every non-system DLL openconnect.exe depends on (ldd is recursive).
-# Run twice in case a freshly copied DLL resolves differently.
-for _ in 1 2; do
-  ldd "$OUT/openconnect.exe" \
-    | awk '{print $3}' \
-    | grep -iE '^/(ucrt64|mingw64)/' \
-    | sort -u \
-    | while read -r dll; do cp -n "$dll" "$OUT/" || true; done
+# Repeat until nothing new turns up, in case a copied DLL pulls in more.
+for _ in 1 2 3; do
+  deps="$(ldd "$OUT/openconnect.exe" || true)"
+  echo "$deps"
+  new=0
+  while read -r dll; do
+    [ -n "$dll" ] || continue
+    name="$(basename "$dll")"
+    if [ ! -f "$OUT/$name" ]; then
+      cp "$dll" "$OUT/$name"
+      new=1
+    fi
+  done < <(echo "$deps" | awk '$2 == "=>" {print $3}' | grep -iE '^/(ucrt64|mingw64)/' || true)
+  [ "$new" = 1 ] || break
 done
+if echo "$deps" | grep -q "not found"; then
+  echo "Missing DLLs:"; echo "$deps" | grep "not found"; exit 1
+fi
 echo "::endgroup::"
 
 echo "::group::Wintun $WINTUN_VERSION"
