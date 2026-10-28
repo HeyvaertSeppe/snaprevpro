@@ -50,7 +50,7 @@ make install
 echo "::endgroup::"
 
 echo "::group::Stage binaries"
-cp "$PREFIX/bin/openconnect.exe" "$OUT/"
+cp "$PREFIX/sbin/openconnect.exe" "$OUT/"
 cp "$PREFIX"/bin/*.dll "$OUT/"
 
 # Copy every non-system DLL openconnect.exe depends on (ldd is recursive).
