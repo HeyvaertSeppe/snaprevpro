@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds openconnect.exe for Windows and stages everything the app bundles
 # into windows-vpn/vendor/openconnect:
-#   openconnect.exe + all its DLLs, wintun.dll, vpnc-script-win.js
+#   openconnect.exe + all its DLLs, wintun.dll, snapvpn-hook.exe
 #
 # Run inside an MSYS2 UCRT64 shell (the GitHub workflow does this).
 set -euo pipefail
@@ -9,8 +9,6 @@ set -euo pipefail
 OC_VERSION="${OC_VERSION:-v9.12}"
 WINTUN_VERSION="0.14.1"
 WINTUN_SHA256="07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
-VPNC_SCRIPTS_COMMIT="6cdb2fe2d75be324564fe27ff85a5e1bb17a66b0"
-VPNC_SCRIPT_SHA256="e196fdf0cc8b325180154535f843034dc0ae9eb43ead9980adfcfc57c58069b2"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/vendor/openconnect"
@@ -26,6 +24,10 @@ cd "$WORK/openconnect"
 # Newer mingw-w64 headers dropped <sec_api/stdlib_s.h>; <stdlib.h> already
 # provides errno_t/size_t, which is all compat.c needed it for.
 sed -i "s|<sec_api/stdlib_s.h>|<stdlib.h>|" compat.c configure.ac
+# Run our own hook instead of cscript.exe (Windows Script Host), which is
+# broken or disabled on some PCs. See scripts/snapvpn-hook.c.
+sed -i 's|"cscript\.exe \\"%s\\""|"snapvpn-hook.exe \\"%s\\""|' script.c
+grep -q 'snapvpn-hook.exe' script.c || { echo "script.c patch did not apply"; exit 1; }
 ./autogen.sh
 # GCC 14+ turned some long-standing warnings into errors, and GCC 15
 # defaults to C23. OpenConnect 9.12 predates both, so build it the way it
@@ -82,10 +84,8 @@ cp "$WORK/wintun/bin/amd64/wintun.dll" "$OUT/"
 cp "$WORK/wintun/LICENSE.txt" "$OUT/wintun-LICENSE.txt"
 echo "::endgroup::"
 
-echo "::group::vpnc-script-win.js"
-curl -fsSL --retry 4 -o "$OUT/vpnc-script-win.js" \
-  "https://gitlab.com/openconnect/vpnc-scripts/-/raw/$VPNC_SCRIPTS_COMMIT/vpnc-script-win.js"
-echo "$VPNC_SCRIPT_SHA256  $OUT/vpnc-script-win.js" | sha256sum -c -
+echo "::group::snapvpn-hook.exe"
+gcc -municode -O2 -Wall -static -s -o "$OUT/snapvpn-hook.exe" "$ROOT/scripts/snapvpn-hook.c"
 echo "::endgroup::"
 
 cp "$WORK/openconnect/COPYING.LGPL" "$OUT/openconnect-COPYING.LGPL"

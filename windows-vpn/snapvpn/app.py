@@ -12,6 +12,7 @@ import customtkinter as ctk
 from . import autostart, instance
 from .config import APP_NAME, DATA_DIR, LOG_FILE, Settings, resource_path
 from .icons import make_icon
+from .snapwatch import SnapchatWatcher
 from .tray import Tray
 from .vpn import State, VpnController
 
@@ -66,6 +67,8 @@ class App(ctk.CTk):
 
         instance.listen(lambda: self._events.put(("action", "show")))
         self.tray.start()
+        self.snapwatch = SnapchatWatcher(self, lambda: self.vpn.state == State.CONNECTED)
+        self.snapwatch.start()
         self.after(50, self._pump)
 
         # Auto-connect as soon as we have a password.

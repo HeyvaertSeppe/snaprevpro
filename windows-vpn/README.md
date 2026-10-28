@@ -28,11 +28,18 @@ the workflow by hand with "Run workflow".
   Run-key programs that need admin rights. The task starts the app in the tray
   at sign-in, with no UAC prompt, and it auto-connects.
 - Launching the .exe again just brings the running window to the front.
-- When the server sends all traffic through the VPN (full tunnel), SnapVPN
-  also routes IPv6 into the tunnel, like AnyConnect does. Otherwise IPv6
-  over Wi-Fi would bypass the VPN, and Windows would keep showing the Wi-Fi
-  icon instead of the Ethernet one. After connecting, "Show log" lists how
-  Windows sees each connection (lines starting with `windows:`).
+- SnapVPN sets up the VPN adapter itself (address, DNS, routes). OpenConnect
+  normally does this with a Windows Script Host script, but that is broken or
+  disabled on some PCs, so the bundled OpenConnect is patched to run
+  `snapvpn-hook.exe` instead (see `scripts/snapvpn-hook.c`). Every network
+  change shows in "Show log" as a `net:` line.
+- With a full tunnel, IPv6 is routed into the VPN too, like AnyConnect does,
+  so it can't leak around the VPN over Wi-Fi. A few seconds after connecting,
+  `windows:` lines in the log show how Windows sees each connection.
+- When a browser tab with Snapchat Web comes to the front while you're
+  connected, a small "Connected using SnapVPN" card shows over the browser for
+  a few seconds (once a minute at most). It doesn't take focus, and a click
+  closes it. When you're not connected, nothing is shown.
 
 Files are kept in `%APPDATA%\SnapVPN\`: `settings.json` (with the encrypted
 password blob) and `vpn.log`. **Forget password** clears the saved password.
@@ -43,7 +50,7 @@ password blob) and `vpn.log`. **Forget password** clears the saved password.
 | --- | --- |
 | `openconnect.exe` + DLLs | Built from OpenConnect `v9.12` (GnuTLS) with MSYS2 UCRT64 in CI |
 | `wintun.dll` | Official signed Wintun 0.14.1 build (SHA-256 checked) |
-| `vpnc-script-win.js` | Pinned commit of `openconnect/vpnc-scripts` (SHA-256 checked) |
+| `snapvpn-hook.exe` | `scripts/snapvpn-hook.c`, built in CI |
 | UI | Python + customtkinter, pystray for the tray |
 
 ## Building locally (on Windows)

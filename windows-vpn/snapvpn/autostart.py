@@ -25,7 +25,8 @@ _NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
 def _schtasks(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["schtasks.exe", *args], capture_output=True, text=True, creationflags=_NO_WINDOW
+        ["schtasks.exe", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        creationflags=_NO_WINDOW,
     )
 
 

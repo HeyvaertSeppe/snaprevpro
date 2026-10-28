@@ -57,7 +57,7 @@ jobs:
         run: python scripts/make_icon.py
 
       - name: Check the app imports cleanly
-        run: python -c "import snapvpn.app, snapvpn.vpn, snapvpn.tray, snapvpn.autostart, snapvpn.dpapi as d; assert d.unprotect(d.protect(b'x')) == b'x'; print('ok')"
+        run: python -c "import snapvpn.app, snapvpn.vpn, snapvpn.tray, snapvpn.autostart, snapvpn.tunnel, snapvpn.snapwatch, snapvpn.dpapi as d; assert d.unprotect(d.protect(b'x')) == b'x'; print('ok')"
 
       - name: Bundled openconnect runs outside MSYS2
         shell: pwsh
@@ -65,6 +65,19 @@ jobs:
           $env:PATH = "C:\Windows\System32;C:\Windows"
           & .\vendor\openconnect\openconnect.exe --version
           if ($LASTEXITCODE -ne 0) { throw "openconnect.exe failed to start" }
+
+      - name: Tunnel hook hands settings to SnapVPN
+        shell: pwsh
+        run: |
+          $dir = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\hook"
+          $env:SNAPVPN_HOOK_DIR = $dir.FullName
+          $env:reason = "pre-init"
+          $env:CISCO_BANNER = "line one`nline two"
+          & .\vendor\openconnect\snapvpn-hook.exe "snapvpn"
+          if ($LASTEXITCODE -ne 0) { throw "snapvpn-hook.exe failed" }
+          $f = Get-ChildItem $dir -Filter *-pre-init.env | Select-Object -First 1
+          if (-not $f) { throw "hook wrote no settings file" }
+          python -c "import sys; sys.path.insert(0, '.'); from snapvpn.tunnel import _read_env; e = _read_env(sys.argv[1]); assert e['REASON'] == 'pre-init' and e['CISCO_BANNER'] == 'line one\nline two', e; print('hook ok')" $f.FullName
 
       - name: Build portable .exe
         run: pyinstaller --noconfirm --clean SnapVPN.spec

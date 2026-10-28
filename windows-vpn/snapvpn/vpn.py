@@ -16,7 +16,7 @@ import time
 from ctypes import wintypes
 from typing import Callable
 
-from . import netfix
+from . import netfix, tunnel
 from .config import ADAPTER_NAME, SERVER, USERNAME, openconnect_dir
 
 
@@ -211,6 +211,13 @@ class VpnController:
         except OSError:
             pass
 
+    def _report_network(self, session_over: threading.Event) -> None:
+        # Give Windows' connectivity check a moment to notice the new routes.
+        if session_over.wait(10):
+            return
+        for line in netfix.network_report():
+            self._log(line)
+
     def _command(self) -> list[str]:
         base = openconnect_dir()
         return [
@@ -220,7 +227,9 @@ class VpnController:
             "--passwd-on-stdin",
             "--non-inter",
             f"--interface={ADAPTER_NAME}",
-            "--script", os.path.join(base, "vpnc-script-win.js"),
+            # Our openconnect build runs snapvpn-hook.exe for this (instead of
+            # Windows Script Host); the value itself is just passed along.
+            "--script", "snapvpn",
             # openconnect retries a dropped session itself for this long;
             # after that it exits and our loop starts a fresh session.
             "--reconnect-timeout=60",
@@ -270,10 +279,19 @@ class VpnController:
             self._log(f"openconnect.exe not found at {exe}")
             return "error"
         self._log(f"Connecting to {SERVER} as {USERNAME}…")
-        # Have the routing script log what it does, so it shows up in our log.
-        env = dict(os.environ, LOG2FILE="1")
-        script_log_offset = netfix.script_log_size()
+        env = dict(os.environ, SNAPVPN_HOOK_DIR=tunnel.HOOK_DIR)
         session_over = threading.Event()
+        configured = threading.Event()
+
+        def on_configured(ok: bool, full_tunnel: bool) -> None:
+            configured.set()
+            if self._want:
+                self._set_state(State.CONNECTED, self.ip)
+                threading.Thread(target=self._report_network, args=(session_over,),
+                                 name="net-report", daemon=True).start()
+
+        watcher = tunnel.HookWatcher(self._log, on_configured)
+        watcher.start()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -285,6 +303,7 @@ class VpnController:
                 creationflags=_CREATE_NO_WINDOW,
             )
         except OSError as e:
+            watcher.stop()
             self._log(f"Failed to start openconnect: {e}")
             return "error"
 
@@ -314,16 +333,11 @@ class VpnController:
             m = _RE_CONFIGURED.search(line)
             if m:
                 self.ip = m.group(1)
-                self._set_state(State.CONNECTED, self.ip)
-                # The routing script has finished by the time this is printed.
-                for script_line in netfix.read_script_log(script_log_offset):
-                    self._log(script_line)
-                script_log_offset = netfix.script_log_size()
-                threading.Thread(
-                    target=netfix.after_connect,
-                    args=(ADAPTER_NAME, self._log, session_over.wait),
-                    name="netfix", daemon=True,
-                ).start()
+                if configured.is_set():
+                    # openconnect re-established a session; the network is already set up.
+                    self._set_state(State.CONNECTED, self.ip)
+                else:
+                    self._set_state(State.CONNECTING, "Setting up network")
                 continue
             if _RE_CONNECTED.search(line) and self.state == State.RECONNECTING and self.ip:
                 self._set_state(State.CONNECTED, self.ip)
@@ -338,6 +352,7 @@ class VpnController:
 
         code = proc.wait()
         session_over.set()
+        watcher.stop()
         with self._lock:
             self._proc = None
         self._log(f"openconnect exited (code {code}).")
