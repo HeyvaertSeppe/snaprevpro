@@ -23,6 +23,9 @@ mkdir -p "$OUT" "$WORK"
 echo "::group::Build OpenConnect $OC_VERSION"
 git clone --depth 1 --branch "$OC_VERSION" https://gitlab.com/openconnect/openconnect.git "$WORK/openconnect"
 cd "$WORK/openconnect"
+# Newer mingw-w64 headers dropped <sec_api/stdlib_s.h>; <stdlib.h> already
+# provides errno_t/size_t, which is all compat.c needed it for.
+sed -i "s|<sec_api/stdlib_s.h>|<stdlib.h>|" compat.c configure.ac
 ./autogen.sh
 ./configure \
   --prefix="$PREFIX" \
