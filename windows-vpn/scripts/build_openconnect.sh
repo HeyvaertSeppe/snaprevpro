@@ -27,6 +27,10 @@ cd "$WORK/openconnect"
 # provides errno_t/size_t, which is all compat.c needed it for.
 sed -i "s|<sec_api/stdlib_s.h>|<stdlib.h>|" compat.c configure.ac
 ./autogen.sh
+# GCC 14+ turned some long-standing warnings into errors, and GCC 15
+# defaults to C23. OpenConnect 9.12 predates both, so build it the way it
+# was written to be built.
+export CFLAGS="-O2 -std=gnu17 -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration"
 ./configure \
   --prefix="$PREFIX" \
   --with-gnutls \
