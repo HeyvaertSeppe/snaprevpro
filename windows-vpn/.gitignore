@@ -1,0 +1,6 @@
+vendor/
+build/
+dist/
+assets/
+__pycache__/
+*.pyc

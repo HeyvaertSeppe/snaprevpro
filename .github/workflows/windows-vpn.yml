@@ -1,0 +1,83 @@
+name: Build Windows VPN app
+
+on:
+  push:
+    paths:
+      - "windows-vpn/**"
+      - ".github/workflows/windows-vpn.yml"
+  pull_request:
+    paths:
+      - "windows-vpn/**"
+      - ".github/workflows/windows-vpn.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows-vpn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            unzip
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-autotools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gnutls
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-lz4
+
+      - name: Build OpenConnect + fetch Wintun
+        shell: msys2 {0}
+        run: bash scripts/build_openconnect.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: windows-vpn/requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Generate icon
+        run: python scripts/make_icon.py
+
+      - name: Check the app imports cleanly
+        run: python -c "import bsd46vpn.app, bsd46vpn.vpn, bsd46vpn.tray, bsd46vpn.autostart, bsd46vpn.dpapi as d; assert d.unprotect(d.protect(b'x')) == b'x'; print('ok')"
+
+      - name: Bundled openconnect runs outside MSYS2
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          & .\vendor\openconnect\openconnect.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "openconnect.exe failed to start" }
+
+      - name: Build portable .exe
+        run: pyinstaller --noconfirm --clean BSD46VPN.spec
+
+      - name: Show result
+        shell: pwsh
+        run: |
+          Get-Item dist\BSD46-VPN.exe | Format-List Name, Length, LastWriteTime
+          (Get-FileHash dist\BSD46-VPN.exe -Algorithm SHA256).Hash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BSD46-VPN
+          path: windows-vpn/dist/BSD46-VPN.exe
+          if-no-files-found: error
